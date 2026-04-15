@@ -56,6 +56,40 @@ def clean_drive_file_url(file_id: str) -> str:
     return f"https://drive.google.com/file/d/{file_id}/view"
 
 
+async def get_public_permission_id(service, file_id: str):
+    perms = await asyncio.to_thread(
+        service.permissions().list(
+            fileId=file_id,
+            fields="permissions(id,type,role)"
+        ).execute
+    )
+    for perm in perms.get("permissions", []):
+        if perm.get("type") == "anyone" and perm.get("role") == "reader":
+            return perm.get("id")
+    return None
+
+
+async def is_file_public(service, file_id: str) -> bool:
+    return await get_public_permission_id(service, file_id) is not None
+
+
+async def build_upload_action_keyboard(service, file_id: str):
+    is_public = await is_file_public(service, file_id)
+    toggle_button = (
+        InlineKeyboardButton("🔒 Make Private", callback_data=f"private_{file_id}")
+        if is_public else
+        InlineKeyboardButton("🌐 Make Public", callback_data=f"public_{file_id}")
+    )
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔗 Open File", url=clean_drive_file_url(file_id))],
+        [toggle_button],
+        [
+            InlineKeyboardButton("✏️ Rename", callback_data=f"rename_{file_id}"),
+            InlineKeyboardButton("🗑 Delete", callback_data=f"delete_{file_id}")
+        ]
+    ])
+
+
 def fix_volume_permissions():
     try:
         subprocess.run(
@@ -366,6 +400,15 @@ async def file_view(update: Update, context: ContextTypes.DEFAULT_TYPE, file_id:
     name = details.get("name", "Unnamed file")
     size_text = format_size(details.get("size"))
     clean_link = clean_drive_file_url(details["id"])
+    public_state = await is_file_public(service, file_id)
+    toggle_button = (
+        InlineKeyboardButton("🔒 Make Private", callback_data=f"private_{file_id}")
+        if public_state else
+        InlineKeyboardButton("🌐 Make Public", callback_data=f"public_{file_id}")
+    )
+
+    context.user_data["files_current_page"] = page
+    context.user_data["files_current_file_id"] = file_id
 
     text = (
         f"📄 {name}\n"
@@ -374,6 +417,7 @@ async def file_view(update: Update, context: ContextTypes.DEFAULT_TYPE, file_id:
     )
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("🔗 Open File", url=clean_link)],
+        [toggle_button],
         [InlineKeyboardButton("🗑 Delete", callback_data=f"delpage_{file_id}_{page}")],
         [InlineKeyboardButton("🔙 Back", callback_data=f"back_{page}")]
     ])
@@ -440,6 +484,55 @@ async def files_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
             )
             await query.edit_message_text("✅ File deleted from Google Drive.")
             await query.answer("✅ File deleted")
+            return
+
+        if data.startswith("public_"):
+            file_id = data[len("public_"):]
+            drive = context.bot_data.get("drive")
+            http = drive.auth.Get_Http_Object()
+            service = build("drive", "v3", http=http, cache_discovery=False)
+
+            if not await is_file_public(service, file_id):
+                await asyncio.to_thread(
+                    service.permissions().create(
+                        fileId=file_id,
+                        body={"type": "anyone", "role": "reader"}
+                    ).execute
+                )
+
+            current_page = context.user_data.get("files_current_page")
+            current_file_id = context.user_data.get("files_current_file_id")
+            if current_page and current_file_id == file_id:
+                await file_view(update, context, file_id=file_id, page=int(current_page))
+            else:
+                keyboard = await build_upload_action_keyboard(service, file_id)
+                await query.edit_message_text("🌐 File is now public", reply_markup=keyboard)
+            await query.answer("🌐 File is now public")
+            return
+
+        if data.startswith("private_"):
+            file_id = data[len("private_"):]
+            drive = context.bot_data.get("drive")
+            http = drive.auth.Get_Http_Object()
+            service = build("drive", "v3", http=http, cache_discovery=False)
+
+            perm_id = await get_public_permission_id(service, file_id)
+            if perm_id:
+                await asyncio.to_thread(
+                    service.permissions().delete(
+                        fileId=file_id,
+                        permissionId=perm_id
+                    ).execute
+                )
+
+            current_page = context.user_data.get("files_current_page")
+            current_file_id = context.user_data.get("files_current_file_id")
+            if current_page and current_file_id == file_id:
+                await file_view(update, context, file_id=file_id, page=int(current_page))
+            else:
+                keyboard = await build_upload_action_keyboard(service, file_id)
+                await query.edit_message_text("🔒 File is now private", reply_markup=keyboard)
+            await query.answer("🔒 File is now private")
             return
 
         if data.startswith("rename_"):
@@ -648,16 +741,11 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 file_size=file_size or 0,
                 progress_callback=update_upload_progress
             )
-        await progress_msg.edit_text(
-            "✅ Uploaded!",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔗 Open File", url=link)],
-                [
-                    InlineKeyboardButton("✏️ Rename", callback_data=f"rename_{uploaded_file_id}"),
-                    InlineKeyboardButton("🗑 Delete", callback_data=f"delete_{uploaded_file_id}")
-                ]
-            ])
-        )
+        http = drive.auth.Get_Http_Object()
+        service = build("drive", "v3", http=http, cache_discovery=False)
+        upload_keyboard = await build_upload_action_keyboard(service, uploaded_file_id)
+
+        await progress_msg.edit_text("✅ Uploaded!", reply_markup=upload_keyboard)
         logger.info(f"Uploaded: {filename} ({size_mb} MB)")
     except Exception as e:
         logger.error(f"Drive upload failed: {e}")
@@ -688,7 +776,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("storage", storage))
     app.add_handler(CommandHandler("files", files))
-    app.add_handler(CallbackQueryHandler(files_callback_handler, pattern=r"^(page_|file_|delpage_|delete_|back_|rename_)"))
+    app.add_handler(CallbackQueryHandler(files_callback_handler, pattern=r"^(page_|file_|delpage_|delete_|back_|rename_|public_|private_)"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_rename_input))
     app.add_handler(MessageHandler(
         filters.Document.ALL | filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE,
