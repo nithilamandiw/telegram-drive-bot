@@ -1,6 +1,7 @@
 import os
 import logging
 import time
+import requests
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
@@ -108,18 +109,18 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
 
     if message.document:
-        tg_file = await message.document.get_file()
+        file_id = message.document.file_id
         filename = message.document.file_name
         file_size = message.document.file_size
 
     elif message.video:
-        tg_file = await message.video.get_file()
+        file_id = message.video.file_id
         filename = message.video.file_name or "video.mp4"
         file_size = message.video.file_size
 
     elif message.photo:
-        tg_file = await message.photo[-1].get_file()
-        filename = f"photo_{tg_file.file_id}.jpg"
+        file_id = message.photo[-1].file_id
+        filename = f"photo_{file_id}.jpg"
         file_size = message.photo[-1].file_size
 
     else:
@@ -135,7 +136,15 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     local_path = f"/tmp/{filename}"
 
-    await tg_file.download_to_drive(local_path)
+    file_info = await context.bot.get_file(file_id)
+    file_path = file_info.file_path
+    download_url = f"http://localhost:8081/file/bot{TELEGRAM_TOKEN}/{file_path}"
+
+    with requests.get(download_url, stream=True) as r:
+        with open(local_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    f.write(chunk)
 
     await download_msg.edit_text(
         f"✅ Downloaded {total_mb:.2f} MB"
