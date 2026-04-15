@@ -56,17 +56,21 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     progress_msg = await message.reply_text(f"⬇️ Downloading: {file_name}")
 
     try:
-        # ✅ GET FILE INFO FROM TELEGRAM
         tg_file = await context.bot.get_file(file_id)
-
         file_path = tg_file.file_path
 
-        if not file_path:
-            await message.reply_text("❌ Invalid file path")
-            return
+        downloaded = 0
 
-        # ✅ DIRECT TELEGRAM CDN DOWNLOAD
-        download_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}"
+        # 🔥 BIG FILE → USE LOCAL API
+        if file_size > 20 * 1024 * 1024:
+            print("🚀 Using LOCAL API")
+
+            download_url = f"http://127.0.0.1:8081/file/bot{TELEGRAM_TOKEN}/{file_path}"
+
+        else:
+            print("🌐 Using TELEGRAM CDN")
+
+            download_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}"
 
         r = requests.get(download_url, stream=True)
 
@@ -74,10 +78,8 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await message.reply_text("❌ Download failed")
             return
 
-        downloaded = 0
-
         with open(local_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1024 * 1024):
+            for chunk in r.iter_content(1024 * 1024):
                 if chunk:
                     f.write(chunk)
                     downloaded += len(chunk)
@@ -103,7 +105,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await progress_msg.edit_text("☁️ Uploading to Google Drive...")
 
-    # ───── UPLOAD TO DRIVE ─────
+    # ───── UPLOAD ─────
     try:
         gfile = drive.CreateFile({
             "title": file_name,
@@ -125,7 +127,10 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             os.remove(local_path)
 
 # ───── RUN BOT ─────
-app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+app = ApplicationBuilder() \
+    .token(TELEGRAM_TOKEN) \
+    .base_url("http://127.0.0.1:8081/bot") \
+    .build()
 
 app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
 
