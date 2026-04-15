@@ -3,6 +3,7 @@ import logging
 import subprocess
 import asyncio
 import uuid
+import time
 import httpx
 from dotenv import load_dotenv
 from googleapiclient.discovery import build
@@ -1063,17 +1064,43 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=cancel_keyboard
     )
 
-    progress_state = {"download": -1, "upload": -1}
+    progress_state = {
+        "download": -1,
+        "upload": -1,
+        "download_start_time": None,
+        "upload_start_time": None,
+        "download_last_update": 0.0,
+        "upload_last_update": 0.0,
+    }
 
     async def update_download_progress(done: int, total: int):
         if not total:
             return
+        now = time.time()
+        if progress_state["download_start_time"] is None:
+            progress_state["download_start_time"] = now
+
         percent = min(100, int(done * 100 / total))
-        if percent == progress_state["download"] or (percent < 100 and percent - progress_state["download"] < 2):
+        # Throttle edits (~1 sec), but always allow final 100% update.
+        if percent < 100 and (now - progress_state["download_last_update"] < 1.0):
             return
         progress_state["download"] = percent
+        progress_state["download_last_update"] = now
         done_mb = done / (1024 * 1024)
         total_mb = total / (1024 * 1024)
+
+        elapsed = now - progress_state["download_start_time"]
+        speed_text = "--"
+        eta_text = "--"
+        if elapsed >= 1 and done > 0:
+            speed_bps = done / elapsed
+            if speed_bps > 0:
+                speed_mb = speed_bps / (1024 * 1024)
+                remaining_bytes = max(total - done, 0)
+                eta_seconds = int(round(remaining_bytes / speed_bps))
+                speed_text = f"{speed_mb:.2f} MB/s"
+                eta_text = f"{eta_seconds}s"
+
         try:
             bar = progress_bar(percent)
             await progress_msg.edit_text(
@@ -1081,7 +1108,9 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"📦 {size_mb} MB\n\n"
                 f"⬇️ Downloading... {percent}%\n"
                 f"{bar}\n"
-                f"{done_mb:.2f}/{total_mb:.2f} MB",
+                f"{done_mb:.2f}/{total_mb:.2f} MB\n\n"
+                f"🚀 Speed: {speed_text}\n"
+                f"⏱ ETA: {eta_text}",
                 reply_markup=cancel_keyboard
             )
         except Exception:
@@ -1090,12 +1119,31 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async def update_upload_progress(done: int, total: int):
         if not total:
             return
+        now = time.time()
+        if progress_state["upload_start_time"] is None:
+            progress_state["upload_start_time"] = now
+
         percent = min(100, int(done * 100 / total))
-        if percent == progress_state["upload"] or (percent < 100 and percent - progress_state["upload"] < 2):
+        # Throttle edits (~1 sec), but always allow final 100% update.
+        if percent < 100 and (now - progress_state["upload_last_update"] < 1.0):
             return
         progress_state["upload"] = percent
+        progress_state["upload_last_update"] = now
         done_mb = done / (1024 * 1024)
         total_mb = total / (1024 * 1024)
+
+        elapsed = now - progress_state["upload_start_time"]
+        speed_text = "--"
+        eta_text = "--"
+        if elapsed >= 1 and done > 0:
+            speed_bps = done / elapsed
+            if speed_bps > 0:
+                speed_mb = speed_bps / (1024 * 1024)
+                remaining_bytes = max(total - done, 0)
+                eta_seconds = int(round(remaining_bytes / speed_bps))
+                speed_text = f"{speed_mb:.2f} MB/s"
+                eta_text = f"{eta_seconds}s"
+
         try:
             bar = progress_bar(percent)
             await progress_msg.edit_text(
@@ -1103,7 +1151,9 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"📦 {size_mb} MB\n\n"
                 f"☁️ Uploading to Google Drive... {percent}%\n"
                 f"{bar}\n"
-                f"{done_mb:.2f}/{total_mb:.2f} MB",
+                f"{done_mb:.2f}/{total_mb:.2f} MB\n\n"
+                f"🚀 Speed: {speed_text}\n"
+                f"⏱ ETA: {eta_text}",
                 reply_markup=cancel_keyboard
             )
         except Exception:
