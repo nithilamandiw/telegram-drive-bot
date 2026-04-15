@@ -84,6 +84,7 @@ async def download_via_local_api(file_id: str, local_path: str) -> bool:
 
         logger.info(f"Reading directly from volume: {host_file_path}")
 
+        fix_volume_permissions()
         if not os.path.exists(host_file_path):
             logger.warning(f"File not found on host at: {host_file_path}")
             return False
