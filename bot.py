@@ -68,8 +68,9 @@ async def download_via_local_api(file_id: str, local_path: str) -> bool:
 
         file_path = data["result"]["file_path"]
 
-        # Step 2: Download the file from local server
-        download_url = f"http://localhost:8081/file/bot{TELEGRAM_TOKEN}/{file_path}"
+        # FIX: The local API returns an absolute path like /var/lib/telegram-bot-api/.../file.psd
+        # Stripping the leading slash prevents a double-slash in the URL (which caused 404s).
+        download_url = f"http://localhost:8081/file/bot{TELEGRAM_TOKEN}/{file_path.lstrip('/')}"
         logger.info(f"Downloading from local API: {file_path}")
 
         async with httpx.AsyncClient(timeout=600) as client:  # 10 min timeout for large files
@@ -87,12 +88,38 @@ async def download_via_local_api(file_id: str, local_path: str) -> bool:
         return False
 
 
-async def download_via_cdn(tg_file_obj, local_path: str) -> bool:
-    """Fallback: standard Telegram CDN (20MB limit)."""
+async def download_via_cdn(file_id: str, local_path: str) -> bool:
+    """Fallback: standard Telegram CDN (20MB limit only).
+    We call the PUBLIC api.telegram.org here — NOT the local server —
+    because the local server's file_path is an absolute filesystem path
+    that the public CDN doesn't understand.
+    """
     try:
-        await tg_file_obj.download_to_drive(local_path)
+        async with httpx.AsyncClient(timeout=60) as client:
+            # Get file info from PUBLIC Telegram API
+            resp = await client.post(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getFile",
+                json={"file_id": file_id}
+            )
+            data = resp.json()
+
+        if not data.get("ok"):
+            logger.warning(f"CDN getFile failed: {data}")
+            return False
+
+        cdn_file_path = data["result"]["file_path"]
+        cdn_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{cdn_file_path}"
+
+        async with httpx.AsyncClient(timeout=120) as client:
+            async with client.stream("GET", cdn_url) as response:
+                response.raise_for_status()
+                with open(local_path, "wb") as f:
+                    async for chunk in response.aiter_bytes(chunk_size=1024 * 1024):
+                        f.write(chunk)
+
         logger.info(f"✅ Downloaded via CDN: {local_path}")
         return True
+
     except Exception as e:
         logger.warning(f"CDN download failed: {e}")
         return False
@@ -153,23 +180,24 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
-    # Try local API first (supports >20MB), fallback to CDN
+    # Try local API first (supports up to 2GB)
     downloaded = await download_via_local_api(file_id, local_path)
 
+    # Fallback to CDN only for files under 20MB
     if not downloaded:
-        logger.info("Falling back to Telegram CDN...")
-        try:
-            tg_file = await context.bot.get_file(file_id)
-            downloaded = await download_via_cdn(tg_file, local_path)
-        except Exception as e:
+        if file_size and file_size > 20 * 1024 * 1024:
             await message.reply_text(
                 f"❌ *Download failed!*\n\n"
+                f"This file is `{size_mb} MB` — too large for the CDN fallback.\n"
                 f"Make sure your local API Docker container is running:\n"
                 f"`docker ps`",
                 parse_mode="Markdown"
             )
-            logger.error(f"All download methods failed: {e}")
+            logger.error(f"Local API failed and file is too large for CDN ({size_mb} MB)")
             return
+
+        logger.info("Falling back to Telegram CDN (file is under 20MB)...")
+        downloaded = await download_via_cdn(file_id, local_path)
 
     if not downloaded:
         await message.reply_text("❌ Could not download the file. Please try again.")
