@@ -18,3 +18,4 @@ build/
 # Temp files
 /tmp/
 *.tmp
+.DS_Store
