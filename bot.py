@@ -7,12 +7,12 @@ from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTyp
 from pydrive2.auth import GoogleAuth
 from pydrive2.drive import GoogleDrive
 
-# ── Load env ─────────────────────────────
+# ───────── ENV ─────────
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")
 
-# ── Google Drive setup ───────────────────
+# ───────── GOOGLE DRIVE ─────────
 def get_drive():
     gauth = GoogleAuth(settings_file="settings.yaml")
 
@@ -33,12 +33,12 @@ def get_drive():
 
 drive = get_drive()
 
-# ── Progress bar ─────────────────────────
+# ───────── PROGRESS BAR ─────────
 def progress_bar(percent):
     filled = percent // 10
     return "█" * filled + "░" * (10 - filled)
 
-# ── Handle file ──────────────────────────
+# ───────── HANDLE FILE ─────────
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
 
@@ -54,31 +54,32 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await message.reply_text(f"⬇️ Downloading: {file_name}")
 
-    download_url = None
+    # 🔥 STEP 1: ALWAYS use RAW API (NO LIMIT)
+    response = requests.post(
+        f"http://localhost:8081/bot{TELEGRAM_TOKEN}/getFile",
+        json={"file_id": file_id}
+    ).json()
 
-    # ── METHOD 1: Try normal (works for small files)
-    try:
-        file_info = await context.bot.get_file(file_id)
-        file_path = file_info.file_path
-        download_url = f"http://localhost:8081/file/bot{TELEGRAM_TOKEN}/{file_path}"
-    except:
-        print("⚠️ get_file failed, using fallback")
+    if not response.get("ok"):
+        await message.reply_text("❌ Failed to get file info")
+        return
 
-    # ── METHOD 2: Fallback (large files)
-    if not download_url:
-        download_url = f"http://localhost:8081/file/bot{TELEGRAM_TOKEN}/{file_id}"
+    file_path = response["result"]["file_path"]
 
-    # ── Download with progress
+    # 🔥 STEP 2: Build correct download URL
+    download_url = f"http://localhost:8081/file/bot{TELEGRAM_TOKEN}/{file_path}"
+
+    # 🔥 STEP 3: Download with progress
     downloaded = 0
     progress_msg = await message.reply_text("Starting download...")
 
     with requests.get(download_url, stream=True) as r:
         if r.status_code != 200:
-            await message.reply_text("❌ Failed to download file")
+            await message.reply_text("❌ Download failed")
             return
 
         with open(local_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1024 * 1024):
+            for chunk in r.iter_content(chunk_size=1024 * 1024):  # 1MB
                 if chunk:
                     f.write(chunk)
                     downloaded += len(chunk)
@@ -100,7 +101,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await progress_msg.edit_text("☁️ Uploading to Google Drive...")
 
-    # ── Upload to Google Drive
+    # 🔥 STEP 4: Upload to Drive
     try:
         gfile = drive.CreateFile({
             "title": file_name,
@@ -121,7 +122,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if os.path.exists(local_path):
             os.remove(local_path)
 
-# ── Run bot ─────────────────────────────
+# ───────── RUN BOT ─────────
 app = ApplicationBuilder() \
     .token(TELEGRAM_TOKEN) \
     .base_url("http://localhost:8081/bot") \
