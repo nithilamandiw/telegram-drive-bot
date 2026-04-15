@@ -305,7 +305,7 @@ async def build_files_page(context: ContextTypes.DEFAULT_TYPE, page: int, page_s
             q=f"'{DRIVE_FOLDER_ID}' in parents and trashed = false",
             orderBy="createdTime desc",
             pageSize=150,
-            fields="files(id,name,size,webViewLink,createdTime)"
+            fields="files(id,name)"
         ).execute
     )
     all_items = result.get("files", [])
@@ -319,32 +319,25 @@ async def build_files_page(context: ContextTypes.DEFAULT_TYPE, page: int, page_s
     end = start + page_size
     items = all_items[start:end]
 
-    lines = [f"📂 Latest files in Drive folder\nPage {page}/{total_pages}\n"]
+    lines = [f"📂 Select a file\nPage {page}/{total_pages}\n"]
     keyboard_rows = []
-    for idx, item in enumerate(items, start=start + 1):
+    for item in items:
         file_id = item.get("id", "")
         name = item.get("name", "Unnamed file")
-        size_text = format_size(item.get("size"))
-        link = item.get("webViewLink")
-        if link:
-            lines.append(f"{name} ({size_text})\n🔗 {link}")
-        else:
-            lines.append(f"{name} ({size_text})")
-        lines.append("")
         if file_id:
             display_name = name if len(name) <= 40 else f"{name[:37]}..."
             keyboard_rows.append([
                 InlineKeyboardButton(
-                    f"🗑 Delete {display_name}",
-                    callback_data=f"delask:{file_id}:{page}"
+                    display_name,
+                    callback_data=f"file_{file_id}_{page}"
                 )
             ])
 
     buttons = []
     if page > 1:
-        buttons.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"files_page_{page - 1}"))
+        buttons.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"page_{page - 1}"))
     if page < total_pages:
-        buttons.append(InlineKeyboardButton("➡️ Next", callback_data=f"files_page_{page + 1}"))
+        buttons.append(InlineKeyboardButton("➡️ Next", callback_data=f"page_{page + 1}"))
     if buttons:
         keyboard_rows.append(buttons)
     keyboard = InlineKeyboardMarkup(keyboard_rows) if keyboard_rows else None
@@ -352,7 +345,36 @@ async def build_files_page(context: ContextTypes.DEFAULT_TYPE, page: int, page_s
     return "\n".join(lines), keyboard
 
 
-async def files_pagination_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def file_view(update: Update, context: ContextTypes.DEFAULT_TYPE, file_id: str, page: int):
+    query = update.callback_query
+    drive = context.bot_data.get("drive")
+    http = drive.auth.Get_Http_Object()
+    service = build("drive", "v3", http=http, cache_discovery=False)
+
+    details = await asyncio.to_thread(
+        service.files().get(
+            fileId=file_id,
+            fields="id,name,size,webViewLink"
+        ).execute
+    )
+
+    name = details.get("name", "Unnamed file")
+    size_text = format_size(details.get("size"))
+    link = details.get("webViewLink", "No link available")
+
+    text = (
+        f"📄 {name}\n"
+        f"📦 {size_text}\n"
+        f"🔗 {link}"
+    )
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🗑 Delete", callback_data=f"delete_{file_id}_{page}")],
+        [InlineKeyboardButton("🔙 Back", callback_data=f"back_{page}")]
+    ])
+    await query.edit_message_text(text=text, reply_markup=keyboard, disable_web_page_preview=True)
+
+
+async def files_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user = update.effective_user
 
@@ -362,56 +384,32 @@ async def files_pagination_callback(update: Update, context: ContextTypes.DEFAUL
 
     try:
         data = query.data or ""
-        if not data.startswith("files_page_"):
-            await query.answer()
-            return
 
-        page = int(data.replace("files_page_", ""))
-        text, keyboard = await build_files_page(context, page=page, page_size=10)
-        await query.edit_message_text(text=text, reply_markup=keyboard)
-        await query.answer()
-    except Exception as e:
-        logger.error(f"Files pagination failed: {e}")
-        await query.answer("Failed to load page", show_alert=True)
-
-
-async def files_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    user = update.effective_user
-
-    if not user or user.id != OWNER_ID:
-        await query.answer("Unauthorized", show_alert=True)
-        return
-
-    try:
-        data = query.data or ""
-
-        if data.startswith("delask:"):
-            _, file_id, page_str = data.split(":", 2)
-            page = int(page_str)
-            keyboard = InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton("✅ Yes, delete", callback_data=f"delyes:{file_id}:{page}"),
-                    InlineKeyboardButton("❌ No", callback_data=f"delno:{page}")
-                ]
-            ])
-            await query.edit_message_text(
-                "⚠️ Are you sure you want to delete this file from Google Drive?",
-                reply_markup=keyboard
-            )
-            await query.answer()
-            return
-
-        if data.startswith("delno:"):
-            _, page_str = data.split(":", 1)
-            page = int(page_str)
+        if data.startswith("page_"):
+            page = int(data.replace("page_", ""))
             text, keyboard = await build_files_page(context, page=page, page_size=10)
             await query.edit_message_text(text=text, reply_markup=keyboard)
-            await query.answer("Cancelled")
+            await query.answer()
             return
 
-        if data.startswith("delyes:"):
-            _, file_id, page_str = data.split(":", 2)
+        if data.startswith("back_"):
+            page = int(data.replace("back_", ""))
+            text, keyboard = await build_files_page(context, page=page, page_size=10)
+            await query.edit_message_text(text=text, reply_markup=keyboard)
+            await query.answer()
+            return
+
+        if data.startswith("file_"):
+            payload = data[len("file_"):]
+            file_id, page_str = payload.rsplit("_", 1)
+            page = int(page_str)
+            await file_view(update, context, file_id=file_id, page=page)
+            await query.answer()
+            return
+
+        if data.startswith("delete_"):
+            payload = data[len("delete_"):]
+            file_id, page_str = payload.rsplit("_", 1)
             page = int(page_str)
 
             drive = context.bot_data.get("drive")
@@ -429,11 +427,11 @@ async def files_delete_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
         await query.answer()
     except HttpError as e:
-        logger.error(f"Delete failed (Drive API): {e}")
-        await query.answer("❌ Delete failed (not found or API error)", show_alert=True)
+        logger.error(f"Files callback failed (Drive API): {e}")
+        await query.answer("❌ Drive API error", show_alert=True)
     except Exception as e:
-        logger.error(f"Delete callback failed: {e}")
-        await query.answer("❌ Delete failed", show_alert=True)
+        logger.error(f"Files callback failed: {e}")
+        await query.answer("❌ Action failed", show_alert=True)
 
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -626,8 +624,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("storage", storage))
     app.add_handler(CommandHandler("files", files))
-    app.add_handler(CallbackQueryHandler(files_delete_callback, pattern=r"^(delask|delyes|delno):"))
-    app.add_handler(CallbackQueryHandler(files_pagination_callback, pattern=r"^files_page_\d+$"))
+    app.add_handler(CallbackQueryHandler(files_callback_handler, pattern=r"^(page_|file_|delete_|back_)"))
     app.add_handler(MessageHandler(
         filters.Document.ALL | filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE,
         handle_file
