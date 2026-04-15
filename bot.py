@@ -52,21 +52,33 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     local_path = f"./{file_name}"
 
-    # ── STEP 1: Get file_path (IMPORTANT FIX)
-    file_info = await context.bot.get_file(file_id)
-    file_path = file_info.file_path
+    await message.reply_text(f"⬇️ Downloading: {file_name}")
 
-    # ── STEP 2: Build correct download URL
-    download_url = f"http://localhost:8081/file/bot{TELEGRAM_TOKEN}/{file_path}"
+    download_url = None
 
-    # ── STEP 3: Download with progress
+    # ── METHOD 1: Try normal (works for small files)
+    try:
+        file_info = await context.bot.get_file(file_id)
+        file_path = file_info.file_path
+        download_url = f"http://localhost:8081/file/bot{TELEGRAM_TOKEN}/{file_path}"
+    except:
+        print("⚠️ get_file failed, using fallback")
+
+    # ── METHOD 2: Fallback (large files)
+    if not download_url:
+        download_url = f"http://localhost:8081/file/bot{TELEGRAM_TOKEN}/{file_id}"
+
+    # ── Download with progress
     downloaded = 0
-
-    progress_msg = await message.reply_text("⬇️ Starting download...")
+    progress_msg = await message.reply_text("Starting download...")
 
     with requests.get(download_url, stream=True) as r:
+        if r.status_code != 200:
+            await message.reply_text("❌ Failed to download file")
+            return
+
         with open(local_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1024 * 1024):  # 1MB
+            for chunk in r.iter_content(chunk_size=1024 * 1024):
                 if chunk:
                     f.write(chunk)
                     downloaded += len(chunk)
@@ -81,28 +93,33 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         await progress_msg.edit_text(
                             f"⬇️ Downloading...\n"
                             f"{bar} {percent}%\n"
-                            f"{mb_done:.2f} / {mb_total:.2f} MB"
+                            f"{mb_done:.2f}/{mb_total:.2f} MB"
                         )
                     except:
                         pass
 
     await progress_msg.edit_text("☁️ Uploading to Google Drive...")
 
-    # ── STEP 4: Upload to Google Drive
-    gfile = drive.CreateFile({
-        "title": file_name,
-        "parents": [{"id": DRIVE_FOLDER_ID}]
-    })
+    # ── Upload to Google Drive
+    try:
+        gfile = drive.CreateFile({
+            "title": file_name,
+            "parents": [{"id": DRIVE_FOLDER_ID}]
+        })
 
-    gfile.SetContentFile(local_path)
-    gfile.Upload()
+        gfile.SetContentFile(local_path)
+        gfile.Upload()
 
-    link = gfile["alternateLink"]
+        link = gfile["alternateLink"]
 
-    await message.reply_text(f"✅ Uploaded!\n🔗 {link}")
+        await message.reply_text(f"✅ Uploaded!\n🔗 {link}")
 
-    # ── Cleanup
-    os.remove(local_path)
+    except Exception as e:
+        await message.reply_text(f"❌ Upload failed: {str(e)}")
+
+    finally:
+        if os.path.exists(local_path):
+            os.remove(local_path)
 
 # ── Run bot ─────────────────────────────
 app = ApplicationBuilder() \
