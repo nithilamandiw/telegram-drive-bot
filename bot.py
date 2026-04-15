@@ -35,6 +35,8 @@ ANALYTICS_FILE = "analytics.json"
 URL_PATTERN = re.compile(r"(https?://\S+)", re.IGNORECASE)
 MAX_URL_DOWNLOAD_SIZE = int(os.getenv("MAX_URL_DOWNLOAD_SIZE", str(2 * 1024 * 1024 * 1024)))
 DOWNLOADS_DIR = "./downloads"
+YTDLP_PROXY = os.getenv("YTDLP_PROXY", "").strip()
+YTDLP_COOKIE_FILE = os.getenv("YTDLP_COOKIE_FILE", "cookies.txt")
 
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -192,6 +194,39 @@ def is_youtube_url(url: str) -> bool:
     return "youtube.com" in netloc or "youtu.be" in netloc
 
 
+def is_youtube_bot_block_error(error_text: str) -> bool:
+    text = (error_text or "").lower()
+    indicators = [
+        "sign in to confirm you're not a bot",
+        "confirm you're not a bot",
+        "sign in to confirm",
+    ]
+    return any(ind in text for ind in indicators)
+
+
+def build_ytdlp_base_opts() -> dict:
+    opts = {
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+        "nocheckcertificate": True,
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+    }
+    if YTDLP_PROXY:
+        opts["proxy"] = YTDLP_PROXY
+    return opts
+
+
+def with_cookiefile(opts: dict) -> dict:
+    merged = dict(opts)
+    if YTDLP_COOKIE_FILE and os.path.exists(YTDLP_COOKIE_FILE):
+        merged["cookiefile"] = YTDLP_COOKIE_FILE
+    return merged
+
+
 def sanitize_filename(name: str, fallback: str = "file") -> str:
     safe = re.sub(r"[^a-zA-Z0-9._ -]", "_", (name or "")).strip().strip(".")
     return safe[:120] if safe else fallback
@@ -199,8 +234,29 @@ def sanitize_filename(name: str, fallback: str = "file") -> str:
 
 async def get_youtube_quality_options(url: str) -> dict:
     def _extract() -> dict:
-        with YoutubeDL({"quiet": True, "skip_download": True, "noplaylist": True, "no_warnings": True}) as ydl:
-            info = ydl.extract_info(url, download=False)
+        base_opts = build_ytdlp_base_opts()
+        primary_opts = {**base_opts, "skip_download": True}
+
+        try:
+            with YoutubeDL(primary_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+        except Exception as primary_error:
+            primary_msg = str(primary_error)
+            if not is_youtube_bot_block_error(primary_msg):
+                raise
+
+            fallback_opts = with_cookiefile(primary_opts)
+            if "cookiefile" not in fallback_opts:
+                raise RuntimeError("YouTube bot protection triggered and cookies.txt was not found") from primary_error
+
+            try:
+                with YoutubeDL(fallback_opts) as ydl:
+                    info = ydl.extract_info(url, download=False)
+            except Exception as fallback_error:
+                fallback_msg = str(fallback_error)
+                if is_youtube_bot_block_error(fallback_msg):
+                    raise RuntimeError("YouTube blocked this video") from fallback_error
+                raise
 
         formats = info.get("formats", [])
         progressive_by_height = {}
@@ -293,10 +349,9 @@ async def download_youtube_with_ytdlp(
                     task_state["downloaded"] = downloaded
                 emit("finished", downloaded)
 
+        base_opts = build_ytdlp_base_opts()
         opts = {
-            "quiet": True,
-            "noplaylist": True,
-            "no_warnings": True,
+            **base_opts,
             "format": format_selector,
             "outtmpl": local_path,
             "progress_hooks": [progress_hook],
@@ -304,8 +359,21 @@ async def download_youtube_with_ytdlp(
             "socket_timeout": 30,
             "concurrent_fragment_downloads": 1,
         }
-        with YoutubeDL(opts) as ydl:
-            ydl.download([url])
+
+        try:
+            with YoutubeDL(opts) as ydl:
+                ydl.download([url])
+        except Exception as primary_error:
+            primary_msg = str(primary_error)
+            if not is_youtube_bot_block_error(primary_msg):
+                raise
+
+            fallback_opts = with_cookiefile(opts)
+            if "cookiefile" not in fallback_opts:
+                raise RuntimeError("YouTube bot protection triggered and cookies.txt was not found") from primary_error
+
+            with YoutubeDL(fallback_opts) as ydl:
+                ydl.download([url])
 
     def worker():
         try:
@@ -2011,7 +2079,10 @@ async def handle_youtube_message(update: Update, context: ContextTypes.DEFAULT_T
         yt_info = await get_youtube_quality_options(url)
     except Exception as e:
         logger.error(f"YouTube format extraction failed: {e}")
-        await status_msg.edit_text("❌ Could not fetch formats. Video may be private/unavailable.")
+        if is_youtube_bot_block_error(str(e)) or "youtube blocked this video" in str(e).lower():
+            await status_msg.edit_text("⚠️ YouTube blocked this video. Try again later.")
+        else:
+            await status_msg.edit_text("❌ Could not fetch formats. Video may be private/unavailable.")
         return True
 
     choices = yt_info.get("choices", {})
