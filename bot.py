@@ -1,12 +1,15 @@
 import os
 import json
+import re
 import logging
 import subprocess
 import asyncio
 import uuid
 import time
 import httpx
+import requests
 from datetime import datetime
+from urllib.parse import urlparse, unquote
 from dotenv import load_dotenv
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -27,6 +30,8 @@ LOCAL_API_DIR = "/var/lib/telegram-bot-api"  # path inside container
 VOLUME_HOST_PATH = "/home/azureuser/telegram-api-data"
 MAX_PARALLEL_UPLOADS = int(os.getenv("MAX_PARALLEL_UPLOADS", "3"))
 ANALYTICS_FILE = "analytics.json"
+URL_PATTERN = re.compile(r"(https?://\S+)", re.IGNORECASE)
+MAX_URL_DOWNLOAD_SIZE = int(os.getenv("MAX_URL_DOWNLOAD_SIZE", str(2 * 1024 * 1024 * 1024)))
 
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -158,6 +163,136 @@ def update_download_analytics():
     data = load_analytics()
     data["total_downloads"] = int(data.get("total_downloads", 0)) + 1
     save_analytics(data)
+
+
+def extract_first_url(text: str) -> str | None:
+    match = URL_PATTERN.search(text or "")
+    if not match:
+        return None
+    # Trim trailing punctuation that often appears in chat messages.
+    return match.group(1).rstrip(").,]}>\"'")
+
+
+def filename_from_url(url: str) -> str:
+    parsed = urlparse(url)
+    raw_name = os.path.basename(parsed.path or "")
+    decoded = unquote(raw_name).strip()
+    if not decoded:
+        return f"url_file_{uuid.uuid4().hex[:8]}.bin"
+
+    safe_name = decoded.replace("/", "_").replace("\\", "_")
+    return safe_name or f"url_file_{uuid.uuid4().hex[:8]}.bin"
+
+
+async def get_url_content_length(url: str) -> int:
+    def _head() -> int:
+        resp = requests.head(url, allow_redirects=True, timeout=10)
+        content_length = resp.headers.get("Content-Length")
+        if not content_length:
+            return 0
+        try:
+            return max(0, int(content_length))
+        except (TypeError, ValueError):
+            return 0
+
+    try:
+        return await asyncio.to_thread(_head)
+    except Exception:
+        return 0
+
+
+async def download_url_with_requests(
+    url: str,
+    local_path: str,
+    file_size: int = 0,
+    progress_callback=None,
+    should_cancel=None,
+    task_state=None,
+) -> bool:
+    loop = asyncio.get_running_loop()
+    queue = asyncio.Queue()
+
+    def emit(event: str, *payload):
+        loop.call_soon_threadsafe(queue.put_nowait, (event, *payload))
+
+    def worker():
+        downloaded = 0
+        try:
+            if task_state is not None:
+                task_state["url"] = url
+                task_state["file_path"] = local_path
+                task_state["downloaded"] = 0
+
+            with requests.get(url, stream=True, timeout=(10, 60), allow_redirects=True) as response:
+                response.raise_for_status()
+                with open(local_path, "wb") as dst:
+                    for chunk in response.iter_content(chunk_size=1024 * 1024):
+                        if should_cancel and should_cancel():
+                            emit("cancel")
+                            return
+
+                        while task_state and task_state.get("paused"):
+                            if should_cancel and should_cancel():
+                                emit("cancel")
+                                return
+                            time.sleep(0.25)
+
+                        if not chunk:
+                            continue
+
+                        dst.write(chunk)
+                        downloaded += len(chunk)
+
+                        if task_state is not None:
+                            task_state["downloaded"] = downloaded
+
+                        if MAX_URL_DOWNLOAD_SIZE > 0 and downloaded > MAX_URL_DOWNLOAD_SIZE:
+                            emit("too_large", downloaded)
+                            return
+
+                        emit("progress", downloaded)
+
+            emit("done", downloaded)
+        except requests.exceptions.Timeout:
+            emit("error", "Timeout while downloading URL")
+        except requests.exceptions.RequestException as e:
+            emit("error", f"Connection failed: {e}")
+        except Exception as e:
+            emit("error", str(e))
+
+    worker_task = asyncio.create_task(asyncio.to_thread(worker))
+    try:
+        while True:
+            event, *payload = await queue.get()
+
+            if event == "progress":
+                downloaded = int(payload[0])
+                if progress_callback:
+                    await progress_callback(downloaded, file_size)
+                continue
+
+            if event == "cancel":
+                raise TransferCancelled("Download cancelled by user")
+
+            if event == "too_large":
+                downloaded = int(payload[0])
+                raise RuntimeError(
+                    f"File exceeds max allowed size ({format_bytes_stats(MAX_URL_DOWNLOAD_SIZE)}). "
+                    f"Downloaded: {format_bytes_stats(downloaded)}"
+                )
+
+            if event == "error":
+                raise RuntimeError(payload[0])
+
+            if event == "done":
+                downloaded = int(payload[0])
+                if progress_callback and file_size:
+                    await progress_callback(file_size, file_size)
+                elif progress_callback and downloaded:
+                    await progress_callback(downloaded, downloaded)
+                return True
+    finally:
+        await worker_task
 
 
 def get_category(filename: str) -> str:
@@ -1332,51 +1467,24 @@ async def resume_transfer_callback(update: Update, context: ContextTypes.DEFAULT
     await query.answer("Resumed")
 
 
-async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def run_transfer_pipeline(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    filename: str,
+    file_size: int,
+    emoji: str,
+    download_runner,
+):
     message = update.message
     drive = context.bot_data.get("drive")
     upload_semaphore = context.bot_data.get("upload_semaphore")
 
-    # Access control: only allow the owner to use file handlers.
-    user = update.effective_user
-    if not user or user.id != OWNER_ID:
-        await message.reply_text("❌ Unauthorized access")
-        return
-
-    # Detect file type
-    if message.document:
-        file_id = message.document.file_id
-        filename = message.document.file_name or f"file_{file_id[:8]}"
-        file_size = message.document.file_size
-        emoji = "📄"
-    elif message.photo:
-        photo = message.photo[-1]
-        file_id = photo.file_id
-        filename = f"photo_{file_id[:8]}.jpg"
-        file_size = photo.file_size
-        emoji = "🖼"
-    elif message.video:
-        file_id = message.video.file_id
-        filename = message.video.file_name or f"video_{file_id[:8]}.mp4"
-        file_size = message.video.file_size
-        emoji = "🎥"
-    elif message.audio:
-        file_id = message.audio.file_id
-        filename = message.audio.file_name or f"audio_{file_id[:8]}.mp3"
-        file_size = message.audio.file_size
-        emoji = "🎵"
-    elif message.voice:
-        file_id = message.voice.file_id
-        filename = f"voice_{file_id[:8]}.ogg"
-        file_size = message.voice.file_size
-        emoji = "🎤"
-    else:
-        await message.reply_text("❓ Please send a file, photo, video, audio or voice message.")
-        return
-
-    size_mb = round(file_size / (1024 * 1024), 2) if file_size else "?"
+    known_size = int(file_size or 0)
+    size_label = f"{known_size / (1024 * 1024):.2f} MB" if known_size else "Unknown"
     local_path = f"/tmp/{filename}"
     task_id = uuid.uuid4().hex[:16]
+
     transfer_tasks = context.bot_data.setdefault("transfer_tasks", {})
     transfer_tasks[task_id] = {
         "paused": False,
@@ -1416,14 +1524,12 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     progress_msg = await message.reply_text(
         f"{emoji} {filename}\n"
-        f"📦 {size_mb} MB\n\n"
+        f"📦 {size_label}\n\n"
         f"⬇️ Downloading... 0%",
         reply_markup=transfer_keyboard()
     )
 
     progress_state = {
-        "download": -1,
-        "upload": -1,
         "download_start_time": None,
         "upload_start_time": None,
         "download_last_update": 0.0,
@@ -1431,64 +1537,69 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
 
     async def update_download_progress(done: int, total: int):
-        if not total:
-            return
         now = time.time()
         if progress_state["download_start_time"] is None:
             progress_state["download_start_time"] = now
 
-        percent = min(100, int(done * 100 / total))
-        # Throttle edits (~1 sec), but always allow final 100% update.
-        if percent < 100 and (now - progress_state["download_last_update"] < 1.0):
+        if now - progress_state["download_last_update"] < 1.0 and done != total:
             return
-        progress_state["download"] = percent
         progress_state["download_last_update"] = now
-        done_mb = done / (1024 * 1024)
-        total_mb = total / (1024 * 1024)
 
-        elapsed = now - progress_state["download_start_time"]
+        done_mb = done / (1024 * 1024)
+        elapsed = max(now - progress_state["download_start_time"], 0.001)
         speed_text = "--"
         eta_text = "--"
-        if elapsed >= 1 and done > 0:
+        if done > 0 and elapsed >= 1:
             speed_bps = done / elapsed
             if speed_bps > 0:
-                speed_mb = speed_bps / (1024 * 1024)
-                remaining_bytes = max(total - done, 0)
-                eta_seconds = int(round(remaining_bytes / speed_bps))
-                speed_text = f"{speed_mb:.2f} MB/s"
-                eta_text = f"{eta_seconds}s"
+                speed_text = f"{(speed_bps / (1024 * 1024)):.2f} MB/s"
+                if total > 0:
+                    remaining_bytes = max(total - done, 0)
+                    eta_text = f"{int(round(remaining_bytes / speed_bps))}s"
 
         try:
-            bar = progress_bar(percent)
-            await progress_msg.edit_text(
-                f"{emoji} {filename}\n"
-                f"📦 {size_mb} MB\n\n"
-                f"⬇️ Downloading... {percent}%\n"
-                f"{bar}\n"
-                f"{done_mb:.2f}/{total_mb:.2f} MB\n\n"
-                f"🚀 Speed: {speed_text}\n"
-                f"⏱ ETA: {eta_text}",
-                reply_markup=transfer_keyboard()
-            )
+            if total > 0:
+                percent = min(100, int(done * 100 / total))
+                total_mb = total / (1024 * 1024)
+                bar = progress_bar(percent)
+                text = (
+                    f"{emoji} {filename}\n"
+                    f"📦 {size_label}\n\n"
+                    f"⬇️ Downloading... {percent}%\n"
+                    f"{bar}\n"
+                    f"{done_mb:.2f}/{total_mb:.2f} MB\n\n"
+                    f"🚀 Speed: {speed_text}\n"
+                    f"⏱ ETA: {eta_text}"
+                )
+            else:
+                text = (
+                    f"{emoji} {filename}\n"
+                    f"📦 {size_label}\n\n"
+                    f"⬇️ Downloading...\n"
+                    f"{done_mb:.2f} MB downloaded\n\n"
+                    f"🚀 Speed: {speed_text}\n"
+                    f"⏱ ETA: --"
+                )
+
+            await progress_msg.edit_text(text, reply_markup=transfer_keyboard())
         except Exception:
             pass
 
     async def update_upload_progress(done: int, total: int):
-        if not total:
+        if total <= 0:
             return
+
         now = time.time()
         if progress_state["upload_start_time"] is None:
             progress_state["upload_start_time"] = now
 
         percent = min(100, int(done * 100 / total))
-        # Throttle edits (~1 sec), but always allow final 100% update.
         if percent < 100 and (now - progress_state["upload_last_update"] < 1.0):
             return
-        progress_state["upload"] = percent
         progress_state["upload_last_update"] = now
+
         done_mb = done / (1024 * 1024)
         total_mb = total / (1024 * 1024)
-
         elapsed = now - progress_state["upload_start_time"]
         speed_text = "--"
         eta_text = "--"
@@ -1505,7 +1616,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             bar = progress_bar(percent)
             await progress_msg.edit_text(
                 f"{emoji} {filename}\n"
-                f"📦 {size_mb} MB\n\n"
+                f"📦 {size_label}\n\n"
                 f"☁️ Uploading to Google Drive... {percent}%\n"
                 f"{bar}\n"
                 f"{done_mb:.2f}/{total_mb:.2f} MB\n\n"
@@ -1517,105 +1628,83 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
     try:
-        # Try local API first (supports up to 2GB)
-        downloaded = await download_via_local_api(
-            file_id,
+        downloaded = await download_runner(
             local_path,
-            file_size=file_size or 0,
-            progress_callback=update_download_progress,
-            should_cancel=is_cancelled,
-            task_state=context.bot_data.get("transfer_tasks", {}).get(task_id)
+            known_size,
+            update_download_progress,
+            is_cancelled,
+            context.bot_data.get("transfer_tasks", {}).get(task_id),
         )
     except TransferCancelled:
         cleanup_local_file()
         await progress_msg.edit_text("❌ Cancelled")
         context.bot_data.get("transfer_tasks", {}).pop(task_id, None)
         return
-
-    # Fallback to CDN only for files under 20MB
-    if not downloaded:
-        if file_size and file_size > 20 * 1024 * 1024:
-            await message.reply_text(
-                f"❌ *Download failed!*\n\n"
-                f"This file is `{size_mb} MB` — too large for the CDN fallback.\n"
-                f"Make sure your local API Docker container is running:\n"
-                f"`docker ps`",
-                parse_mode="Markdown"
-            )
-            logger.error(f"Local API failed and file is too large for CDN ({size_mb} MB)")
-            context.bot_data.get("transfer_tasks", {}).pop(task_id, None)
-            return
-
-        logger.info("Falling back to Telegram CDN (file is under 20MB)...")
-        try:
-            downloaded = await download_via_cdn(
-                file_id,
-                local_path,
-                file_size=file_size or 0,
-                progress_callback=update_download_progress,
-                should_cancel=is_cancelled,
-                task_state=context.bot_data.get("transfer_tasks", {}).get(task_id)
-            )
-        except TransferCancelled:
-            cleanup_local_file()
-            await progress_msg.edit_text("❌ Cancelled")
-            context.bot_data.get("transfer_tasks", {}).pop(task_id, None)
-            return
+    except Exception as e:
+        cleanup_local_file()
+        context.bot_data.get("transfer_tasks", {}).pop(task_id, None)
+        await message.reply_text(f"❌ Download failed:\n`{str(e)}`", parse_mode="Markdown")
+        return
 
     if not downloaded:
         await message.reply_text("❌ Could not download the file. Please try again.")
         context.bot_data.get("transfer_tasks", {}).pop(task_id, None)
         return
 
+    if known_size <= 0:
+        known_size = int(context.bot_data.get("transfer_tasks", {}).get(task_id, {}).get("downloaded", 0) or 0)
+        size_label = f"{known_size / (1024 * 1024):.2f} MB" if known_size else "Unknown"
+
     try:
         update_download_analytics()
     except Exception as e:
         logger.warning(f"Failed to update download analytics: {e}")
 
-    # Upload to Google Drive
     if task_id in context.bot_data.get("transfer_tasks", {}):
         context.bot_data["transfer_tasks"][task_id]["stage"] = "upload"
-    await update_upload_progress(0, file_size or 0)
+    await update_upload_progress(0, known_size)
+
     try:
         if upload_semaphore:
             await progress_msg.edit_text(
                 f"{emoji} {filename}\n"
-                f"📦 {size_mb} MB\n\n"
+                f"📦 {size_label}\n\n"
                 f"⏳ Waiting for upload slot...",
                 reply_markup=transfer_keyboard()
             )
 
             async with upload_semaphore:
-                await update_upload_progress(0, file_size or 0)
-                uploaded_file_id, link = await upload_to_drive(
+                await update_upload_progress(0, known_size)
+                uploaded_file_id, _ = await upload_to_drive(
                     context,
                     drive,
                     local_path,
                     filename,
-                    file_size=file_size or 0,
+                    file_size=known_size,
                     progress_callback=update_upload_progress,
                     should_cancel=is_cancelled
                 )
         else:
-            uploaded_file_id, link = await upload_to_drive(
+            uploaded_file_id, _ = await upload_to_drive(
                 context,
                 drive,
                 local_path,
                 filename,
-                file_size=file_size or 0,
+                file_size=known_size,
                 progress_callback=update_upload_progress,
                 should_cancel=is_cancelled
             )
+
         http = drive.auth.Get_Http_Object()
         service = build("drive", "v3", http=http, cache_discovery=False)
         upload_keyboard = await build_upload_action_keyboard(context, service, uploaded_file_id)
 
         await progress_msg.edit_text("✅ Uploaded!", reply_markup=upload_keyboard)
         try:
-            update_upload_analytics(filename, file_size or 0)
+            update_upload_analytics(filename, known_size)
         except Exception as e:
             logger.warning(f"Failed to update upload analytics: {e}")
-        logger.info(f"Uploaded: {filename} ({size_mb} MB)")
+        logger.info(f"Uploaded: {filename} ({size_label})")
     except TransferCancelled:
         cleanup_local_file()
         await progress_msg.edit_text("❌ Cancelled")
@@ -1626,6 +1715,145 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         cleanup_local_file()
         context.bot_data.get("transfer_tasks", {}).pop(task_id, None)
+
+
+async def handle_url_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    user = update.effective_user
+
+    text = (message.text or "").strip()
+    url = extract_first_url(text)
+    if not url:
+        return
+
+    if not user or user.id != OWNER_ID:
+        await message.reply_text("❌ Unauthorized access")
+        return
+
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        await message.reply_text("❌ Invalid URL")
+        return
+
+    file_size = await get_url_content_length(url)
+    if file_size and MAX_URL_DOWNLOAD_SIZE > 0 and file_size > MAX_URL_DOWNLOAD_SIZE:
+        await message.reply_text(
+            f"❌ File too large:\n"
+            f"Size: {format_bytes_stats(file_size)}\n"
+            f"Limit: {format_bytes_stats(MAX_URL_DOWNLOAD_SIZE)}"
+        )
+        return
+
+    filename = filename_from_url(url)
+
+    async def url_download_runner(local_path, known_size, progress_callback, should_cancel, task_state):
+        return await download_url_with_requests(
+            url=url,
+            local_path=local_path,
+            file_size=known_size,
+            progress_callback=progress_callback,
+            should_cancel=should_cancel,
+            task_state=task_state,
+        )
+
+    await run_transfer_pipeline(
+        update,
+        context,
+        filename=filename,
+        file_size=file_size,
+        emoji="🌐",
+        download_runner=url_download_runner,
+    )
+
+
+async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get("rename_file_id"):
+        await handle_rename_input(update, context)
+        return
+    await handle_url_message(update, context)
+
+
+async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+
+    # Access control: only allow the owner to use file handlers.
+    user = update.effective_user
+    if not user or user.id != OWNER_ID:
+        await message.reply_text("❌ Unauthorized access")
+        return
+
+    # Detect file type
+    if message.document:
+        file_id = message.document.file_id
+        filename = message.document.file_name or f"file_{file_id[:8]}"
+        file_size = message.document.file_size
+        emoji = "📄"
+    elif message.photo:
+        photo = message.photo[-1]
+        file_id = photo.file_id
+        filename = f"photo_{file_id[:8]}.jpg"
+        file_size = photo.file_size
+        emoji = "🖼"
+    elif message.video:
+        file_id = message.video.file_id
+        filename = message.video.file_name or f"video_{file_id[:8]}.mp4"
+        file_size = message.video.file_size
+        emoji = "🎥"
+    elif message.audio:
+        file_id = message.audio.file_id
+        filename = message.audio.file_name or f"audio_{file_id[:8]}.mp3"
+        file_size = message.audio.file_size
+        emoji = "🎵"
+    elif message.voice:
+        file_id = message.voice.file_id
+        filename = f"voice_{file_id[:8]}.ogg"
+        file_size = message.voice.file_size
+        emoji = "🎤"
+    else:
+        await message.reply_text("❓ Please send a file, photo, video, audio or voice message.")
+        return
+
+    async def telegram_download_runner(local_path, known_size, progress_callback, should_cancel, task_state):
+        try:
+            downloaded = await download_via_local_api(
+                file_id,
+                local_path,
+                file_size=known_size,
+                progress_callback=progress_callback,
+                should_cancel=should_cancel,
+                task_state=task_state,
+            )
+        except TransferCancelled:
+            raise
+
+        if downloaded:
+            return True
+
+        if known_size and known_size > 20 * 1024 * 1024:
+            size_mb = known_size / (1024 * 1024)
+            raise RuntimeError(
+                "Download failed. File is too large for CDN fallback "
+                f"({size_mb:.2f} MB). Ensure local API Docker is running."
+            )
+
+        logger.info("Falling back to Telegram CDN (file is under 20MB)...")
+        return await download_via_cdn(
+            file_id,
+            local_path,
+            file_size=known_size,
+            progress_callback=progress_callback,
+            should_cancel=should_cancel,
+            task_state=task_state,
+        )
+
+    await run_transfer_pipeline(
+        update,
+        context,
+        filename=filename,
+        file_size=file_size or 0,
+        emoji=emoji,
+        download_runner=telegram_download_runner,
+    )
 
 
 def main():
@@ -1656,7 +1884,7 @@ def main():
     app.add_handler(CallbackQueryHandler(resume_transfer_callback, pattern=r"^resume_"))
     app.add_handler(CallbackQueryHandler(cancel_transfer_callback, pattern=r"^cancel_"))
     app.add_handler(CallbackQueryHandler(files_callback_handler, pattern=r"^cb_"))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_rename_input))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input))
     app.add_handler(MessageHandler(
         filters.Document.ALL | filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE,
         handle_file
