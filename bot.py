@@ -359,8 +359,49 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
 
     try:
-        text, keyboard = await build_search_page(context, session_id=session_id, page=1, page_size=10)
-        await message.reply_text(text, reply_markup=keyboard, disable_web_page_preview=True)
+        drive = context.bot_data.get("drive")
+        http = drive.auth.Get_Http_Object()
+        service = build("drive", "v3", http=http, cache_discovery=False)
+
+        safe_query = escape_drive_query_value(query.lower().strip())
+        suggestion_result = await asyncio.to_thread(
+            service.files().list(
+                q=f"'{DRIVE_FOLDER_ID}' in parents and trashed = false and name contains '{safe_query}'",
+                orderBy="createdTime desc",
+                pageSize=11,  # 10 suggestions + 1 extra to know if there are more
+                fields="nextPageToken,files(id,name)"
+            ).execute
+        )
+
+        items = suggestion_result.get("files", [])
+        if not items:
+            await message.reply_text(f"🔎 No files found for: {query}")
+            return
+
+        suggestions = items[:10]
+        has_more = len(items) > 10 or bool(suggestion_result.get("nextPageToken"))
+
+        keyboard_rows = []
+        for item in suggestions:
+            file_id = item.get("id")
+            name = item.get("name", "Unnamed file")
+            if file_id:
+                label = name if len(name) <= 40 else f"{name[:37]}..."
+                keyboard_rows.append([
+                    InlineKeyboardButton(label, callback_data=f"file_{file_id}")
+                ])
+
+        if has_more:
+            keyboard_rows.append([
+                InlineKeyboardButton("📚 View all results", callback_data=f"search:{session_id}:1")
+            ])
+
+        sent = await message.reply_text(
+            f"🔎 Suggestions for: {query}",
+            reply_markup=InlineKeyboardMarkup(keyboard_rows),
+            disable_web_page_preview=True
+        )
+        context.user_data.setdefault("search_message_sessions", {})[sent.message_id] = session_id
     except Exception as e:
         logger.error(f"Search command failed: {e}")
         await message.reply_text(f"❌ Search failed:\n`{str(e)}`", parse_mode="Markdown")
@@ -640,9 +681,35 @@ async def files_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
 
         if data.startswith("file_"):
             payload = data[len("file_"):]
-            file_id, page_str = payload.rsplit("_", 1)
-            page = int(page_str)
-            await file_view(update, context, file_id=file_id, page=page)
+
+            # /files flow: file_<fileId>_<page>
+            # /search suggestion flow: file_<fileId>
+            page = 1
+            file_id = payload
+            if "_" in payload:
+                possible_file_id, possible_page = payload.rsplit("_", 1)
+                if possible_page.isdigit():
+                    file_id = possible_file_id
+                    page = int(possible_page)
+                    await file_view(update, context, file_id=file_id, page=page)
+                    await query.answer()
+                    return
+
+            # Reuse file view for suggestion clicks, and wire back to paged search results.
+            session_id = None
+            if query.message:
+                session_id = context.user_data.get("search_message_sessions", {}).get(query.message.message_id)
+            if session_id:
+                await file_view(
+                    update,
+                    context,
+                    file_id=file_id,
+                    page=1,
+                    back_callback=f"search:{session_id}:1",
+                    delete_callback=f"sdel:{file_id}:{session_id}:1"
+                )
+            else:
+                await file_view(update, context, file_id=file_id, page=1)
             await query.answer()
             return
 
