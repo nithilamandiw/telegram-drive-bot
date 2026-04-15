@@ -167,6 +167,39 @@ async def is_file_public(service, file_id: str) -> bool:
     return await get_public_permission_id(service, file_id) is not None
 
 
+async def ensure_public_permission(service, file_id: str) -> str:
+    existing = await get_public_permission_id(service, file_id)
+    if existing:
+        return existing
+    created = await asyncio.to_thread(
+        service.permissions().create(
+            fileId=file_id,
+            body={"type": "anyone", "role": "reader"},
+            fields="id"
+        ).execute
+    )
+    return created["id"]
+
+
+async def revoke_public_after_delay(context: ContextTypes.DEFAULT_TYPE, file_id: str, permission_id: str, delay_seconds: int):
+    try:
+        await asyncio.sleep(delay_seconds)
+        drive = context.bot_data.get("drive")
+        if not drive:
+            return
+        http = drive.auth.Get_Http_Object()
+        service = build("drive", "v3", http=http, cache_discovery=False)
+        await asyncio.to_thread(
+            service.permissions().delete(
+                fileId=file_id,
+                permissionId=permission_id
+            ).execute
+        )
+        logger.info(f"Expired public link revoked for file: {file_id}")
+    except Exception as e:
+        logger.warning(f"Failed to revoke expiring link for {file_id}: {e}")
+
+
 async def build_upload_action_keyboard(context: ContextTypes.DEFAULT_TYPE, service, file_id: str):
     is_public = await is_file_public(service, file_id)
     toggle_button = (
@@ -177,6 +210,10 @@ async def build_upload_action_keyboard(context: ContextTypes.DEFAULT_TYPE, servi
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔗 Open File", url=clean_drive_file_url(file_id))],
         [toggle_button],
+        [
+            InlineKeyboardButton("⏱ 1h Link", callback_data=make_callback_data(context, "expire_link", file_id=file_id, duration=3600)),
+            InlineKeyboardButton("⏱ 24h Link", callback_data=make_callback_data(context, "expire_link", file_id=file_id, duration=86400)),
+        ],
         [
             InlineKeyboardButton("✏️ Rename", callback_data=make_callback_data(context, "rename", file_id=file_id)),
             InlineKeyboardButton("🗑 Delete", callback_data=make_callback_data(context, "delete_upload", file_id=file_id))
@@ -801,6 +838,10 @@ async def file_view(
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("🔗 Open File", url=clean_link)],
         [toggle_button],
+        [
+            InlineKeyboardButton("⏱ 1h Link", callback_data=make_callback_data(context, "expire_link", file_id=file_id, duration=3600)),
+            InlineKeyboardButton("⏱ 24h Link", callback_data=make_callback_data(context, "expire_link", file_id=file_id, duration=86400)),
+        ],
         [InlineKeyboardButton("✏️ Rename", callback_data=make_callback_data(context, "rename", file_id=file_id))],
         [InlineKeyboardButton("🗑 Delete", callback_data=delete_callback)],
         [InlineKeyboardButton("🔙 Back", callback_data=back_callback)]
@@ -848,6 +889,10 @@ async def refresh_file_view_message(
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("🔗 Open File", url=clean_link)],
         [toggle_button],
+        [
+            InlineKeyboardButton("⏱ 1h Link", callback_data=make_callback_data(context, "expire_link", file_id=file_id, duration=3600)),
+            InlineKeyboardButton("⏱ 24h Link", callback_data=make_callback_data(context, "expire_link", file_id=file_id, duration=86400)),
+        ],
         [InlineKeyboardButton("✏️ Rename", callback_data=make_callback_data(context, "rename", file_id=file_id))],
         [InlineKeyboardButton("🗑 Delete", callback_data=delete_callback)],
         [InlineKeyboardButton("🔙 Back", callback_data=back_callback)]
@@ -1004,6 +1049,25 @@ async def files_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
                 msg = "🌐 File is now public" if action == "public" else "🔒 File is now private"
                 await query.edit_message_text(msg, reply_markup=keyboard)
             await query.answer("🌐 File is now public" if action == "public" else "🔒 File is now private")
+            return
+
+        if action == "expire_link":
+            file_id = payload.get("file_id")
+            duration = int(payload.get("duration", 3600))
+            drive = context.bot_data.get("drive")
+            http = drive.auth.Get_Http_Object()
+            service = build("drive", "v3", http=http, cache_discovery=False)
+
+            permission_id = await ensure_public_permission(service, file_id)
+            asyncio.create_task(revoke_public_after_delay(context, file_id, permission_id, duration))
+
+            hours_label = "1 hour" if duration == 3600 else ("24 hours" if duration == 86400 else f"{duration}s")
+            link = clean_drive_file_url(file_id)
+            if query.message:
+                await query.message.reply_text(
+                    f"🔗 Link valid for {hours_label}\n{link}"
+                )
+            await query.answer(f"Link enabled for {hours_label}")
             return
 
         if action == "rename":
