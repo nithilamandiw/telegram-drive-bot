@@ -36,7 +36,6 @@ URL_PATTERN = re.compile(r"(https?://\S+)", re.IGNORECASE)
 MAX_URL_DOWNLOAD_SIZE = int(os.getenv("MAX_URL_DOWNLOAD_SIZE", str(2 * 1024 * 1024 * 1024)))
 DOWNLOADS_DIR = "./downloads"
 YTDLP_PROXY = os.getenv("YTDLP_PROXY", "").strip()
-YTDLP_COOKIE_FILE = os.getenv("YTDLP_COOKIE_FILE", "cookies.txt")
 
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -200,6 +199,8 @@ def is_youtube_bot_block_error(error_text: str) -> bool:
         "sign in to confirm you're not a bot",
         "confirm you're not a bot",
         "sign in to confirm",
+        "this content isn't available",
+        "age-restricted",
     ]
     return any(ind in text for ind in indicators)
 
@@ -207,8 +208,13 @@ def is_youtube_bot_block_error(error_text: str) -> bool:
 def build_ytdlp_base_opts() -> dict:
     opts = {
         "http_headers": {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            "User-Agent": "com.google.android.youtube/17.31.35",
             "Accept-Language": "en-US,en;q=0.9",
+        },
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "web"]
+            }
         },
         "nocheckcertificate": True,
         "quiet": True,
@@ -218,13 +224,6 @@ def build_ytdlp_base_opts() -> dict:
     if YTDLP_PROXY:
         opts["proxy"] = YTDLP_PROXY
     return opts
-
-
-def with_cookiefile(opts: dict) -> dict:
-    merged = dict(opts)
-    if YTDLP_COOKIE_FILE and os.path.exists(YTDLP_COOKIE_FILE):
-        merged["cookiefile"] = YTDLP_COOKIE_FILE
-    return merged
 
 
 def sanitize_filename(name: str, fallback: str = "file") -> str:
@@ -242,21 +241,9 @@ async def get_youtube_quality_options(url: str) -> dict:
                 info = ydl.extract_info(url, download=False)
         except Exception as primary_error:
             primary_msg = str(primary_error)
-            if not is_youtube_bot_block_error(primary_msg):
-                raise
-
-            fallback_opts = with_cookiefile(primary_opts)
-            if "cookiefile" not in fallback_opts:
-                raise RuntimeError("YouTube bot protection triggered and cookies.txt was not found") from primary_error
-
-            try:
-                with YoutubeDL(fallback_opts) as ydl:
-                    info = ydl.extract_info(url, download=False)
-            except Exception as fallback_error:
-                fallback_msg = str(fallback_error)
-                if is_youtube_bot_block_error(fallback_msg):
-                    raise RuntimeError("YouTube blocked this video") from fallback_error
-                raise
+            if is_youtube_bot_block_error(primary_msg):
+                raise RuntimeError("⚠️ This video is restricted by YouTube") from primary_error
+            raise
 
         formats = info.get("formats", [])
         progressive_by_height = {}
@@ -365,15 +352,9 @@ async def download_youtube_with_ytdlp(
                 ydl.download([url])
         except Exception as primary_error:
             primary_msg = str(primary_error)
-            if not is_youtube_bot_block_error(primary_msg):
-                raise
-
-            fallback_opts = with_cookiefile(opts)
-            if "cookiefile" not in fallback_opts:
-                raise RuntimeError("YouTube bot protection triggered and cookies.txt was not found") from primary_error
-
-            with YoutubeDL(fallback_opts) as ydl:
-                ydl.download([url])
+            if is_youtube_bot_block_error(primary_msg):
+                raise RuntimeError("⚠️ This video is restricted by YouTube") from primary_error
+            raise
 
     def worker():
         try:
@@ -2079,8 +2060,8 @@ async def handle_youtube_message(update: Update, context: ContextTypes.DEFAULT_T
         yt_info = await get_youtube_quality_options(url)
     except Exception as e:
         logger.error(f"YouTube format extraction failed: {e}")
-        if is_youtube_bot_block_error(str(e)) or "youtube blocked this video" in str(e).lower():
-            await status_msg.edit_text("⚠️ YouTube blocked this video. Try again later.")
+        if is_youtube_bot_block_error(str(e)) or "restricted by youtube" in str(e).lower():
+            await status_msg.edit_text("⚠️ This video is restricted by YouTube")
         else:
             await status_msg.edit_text("❌ Could not fetch formats. Video may be private/unavailable.")
         return True
