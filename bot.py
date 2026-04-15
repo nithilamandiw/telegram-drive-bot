@@ -632,6 +632,45 @@ async def build_upload_action_keyboard(context: ContextTypes.DEFAULT_TYPE, servi
     ])
 
 
+async def check_duplicate(service, filename: str, file_size: int | None):
+    if not filename or not file_size:
+        return None
+
+    query = (
+        f"name='{escape_drive_query_value(filename)}' and "
+        f"'{DRIVE_FOLDER_ID}' in parents and trashed=false"
+    )
+
+    result = await asyncio.to_thread(
+        service.files().list(
+            q=query,
+            fields="files(id,name,size)",
+            pageSize=100
+        ).execute
+    )
+
+    for item in result.get("files", []):
+        size_raw = item.get("size")
+        if size_raw is None:
+            continue
+        try:
+            if int(size_raw) == int(file_size):
+                return item.get("id")
+        except (TypeError, ValueError):
+            continue
+
+    return None
+
+
+def build_duplicate_keyboard(task_id: str):
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("⏭ Skip", callback_data=f"dup_skip_{task_id}"),
+            InlineKeyboardButton("♻️ Replace", callback_data=f"dup_replace_{task_id}")
+        ]
+    ])
+
+
 def fix_volume_permissions():
     try:
         subprocess.run(
@@ -1666,6 +1705,81 @@ async def cancel_transfer_callback(update: Update, context: ContextTypes.DEFAULT
         await query.answer("Task not found or already finished", show_alert=True)
 
 
+async def duplicate_upload_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = update.effective_user
+
+    if not user or user.id != OWNER_ID:
+        await query.answer("Unauthorized", show_alert=True)
+        return
+
+    data = query.data or ""
+    if not data.startswith("dup_"):
+        await query.answer()
+        return
+
+    parts = data.split("_")
+    if len(parts) != 3:
+        await query.answer("Invalid action", show_alert=True)
+        return
+
+    action = parts[1]
+    task_id = parts[2]
+    task_data = context.bot_data.get(task_id)
+    if not isinstance(task_data, dict):
+        await query.answer("Upload task expired", show_alert=True)
+        return
+
+    decision_future = task_data.get("decision_future")
+    if decision_future is None:
+        await query.answer("Upload task expired", show_alert=True)
+        context.bot_data.pop(task_id, None)
+        return
+
+    if action == "skip":
+        local_path = task_data.get("file_path")
+        if local_path and os.path.exists(local_path):
+            try:
+                os.remove(local_path)
+            except Exception:
+                pass
+
+        if not decision_future.done():
+            decision_future.set_result("skip")
+        context.bot_data.pop(task_id, None)
+        await query.edit_message_text("❌ Upload skipped")
+        await query.answer("Skipped")
+        return
+
+    if action == "replace":
+        existing_file_id = task_data.get("existing_file_id")
+        if existing_file_id:
+            try:
+                drive = context.bot_data.get("drive")
+                http = drive.auth.Get_Http_Object()
+                service = build("drive", "v3", http=http, cache_discovery=False)
+                await asyncio.to_thread(
+                    service.files().delete(fileId=existing_file_id).execute
+                )
+            except Exception as e:
+                logger.error(f"Failed to delete duplicate before replace: {e}")
+                if not decision_future.done():
+                    decision_future.set_exception(RuntimeError("Could not replace existing file"))
+                context.bot_data.pop(task_id, None)
+                await query.edit_message_text("❌ Failed to replace existing file")
+                await query.answer("Replace failed", show_alert=True)
+                return
+
+        if not decision_future.done():
+            decision_future.set_result("replace")
+        context.bot_data.pop(task_id, None)
+        await query.edit_message_text("♻️ Replacing existing file...")
+        await query.answer("Replacing")
+        return
+
+    await query.answer("Unknown action", show_alert=True)
+
+
 async def pause_transfer_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user = update.effective_user
@@ -1921,6 +2035,44 @@ async def run_transfer_pipeline(
         update_download_analytics()
     except Exception as e:
         logger.warning(f"Failed to update download analytics: {e}")
+
+    # Duplicate detection by exact filename and size before upload.
+    try:
+        http = drive.auth.Get_Http_Object()
+        service = build("drive", "v3", http=http, cache_discovery=False)
+        existing_id = await check_duplicate(service, filename, known_size)
+    except Exception as e:
+        logger.warning(f"Duplicate check failed, continuing upload: {e}")
+        existing_id = None
+
+    if existing_id:
+        dup_task_id = uuid.uuid4().hex[:8]
+        decision_future = asyncio.get_running_loop().create_future()
+        context.bot_data[dup_task_id] = {
+            "file_name": filename,
+            "file_path": local_path,
+            "existing_file_id": existing_id,
+            "decision_future": decision_future,
+        }
+
+        await progress_msg.edit_text(
+            "⚠️ File already exists\n"
+            f"Name: {filename}\n"
+            f"Size: {format_bytes_stats(known_size)}",
+            reply_markup=build_duplicate_keyboard(dup_task_id)
+        )
+
+        try:
+            decision = await decision_future
+        except Exception as e:
+            cleanup_local_file()
+            context.bot_data.pop(task_id, None)
+            await progress_msg.edit_text(f"❌ Duplicate resolution failed:\n`{str(e)}`", parse_mode="Markdown")
+            return
+
+        if decision == "skip":
+            context.bot_data.get("transfer_tasks", {}).pop(task_id, None)
+            return
 
     if task_id in context.bot_data.get("transfer_tasks", {}):
         context.bot_data["transfer_tasks"][task_id]["stage"] = "upload"
@@ -2226,6 +2378,7 @@ def main():
     app.add_handler(CallbackQueryHandler(pause_transfer_callback, pattern=r"^pause_"))
     app.add_handler(CallbackQueryHandler(resume_transfer_callback, pattern=r"^resume_"))
     app.add_handler(CallbackQueryHandler(cancel_transfer_callback, pattern=r"^cancel_"))
+    app.add_handler(CallbackQueryHandler(duplicate_upload_callback, pattern=r"^dup_"))
     app.add_handler(CallbackQueryHandler(files_callback_handler, pattern=r"^cb_"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input))
     app.add_handler(MessageHandler(
