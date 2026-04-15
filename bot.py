@@ -36,6 +36,22 @@ def progress_bar(percent: int, width: int = 12) -> str:
     return "█" * filled + "░" * (width - filled)
 
 
+def format_size(size_bytes) -> str:
+    if size_bytes is None:
+        return "Unknown size"
+    try:
+        size = float(size_bytes)
+    except (TypeError, ValueError):
+        return "Unknown size"
+
+    units = ["B", "KB", "MB", "GB", "TB"]
+    unit_idx = 0
+    while size >= 1024 and unit_idx < len(units) - 1:
+        size /= 1024.0
+        unit_idx += 1
+    return f"{size:.1f} {units[unit_idx]}"
+
+
 def fix_volume_permissions():
     try:
         subprocess.run(
@@ -289,7 +305,7 @@ async def build_files_page(context: ContextTypes.DEFAULT_TYPE, page: int, page_s
             q=f"'{DRIVE_FOLDER_ID}' in parents and trashed = false",
             orderBy="createdTime desc",
             pageSize=150,
-            fields="files(id,name,webViewLink,createdTime)"
+            fields="files(id,name,size,webViewLink,createdTime)"
         ).execute
     )
     all_items = result.get("files", [])
@@ -308,15 +324,18 @@ async def build_files_page(context: ContextTypes.DEFAULT_TYPE, page: int, page_s
     for idx, item in enumerate(items, start=start + 1):
         file_id = item.get("id", "")
         name = item.get("name", "Unnamed file")
+        size_text = format_size(item.get("size"))
         link = item.get("webViewLink")
         if link:
-            lines.append(f"{idx}. {name}\n   🔗 {link}")
+            lines.append(f"{name} ({size_text})\n🔗 {link}")
         else:
-            lines.append(f"{idx}. {name}")
+            lines.append(f"{name} ({size_text})")
+        lines.append("")
         if file_id:
+            display_name = name if len(name) <= 40 else f"{name[:37]}..."
             keyboard_rows.append([
                 InlineKeyboardButton(
-                    f"🗑 Delete {idx}",
+                    f"🗑 Delete {display_name}",
                     callback_data=f"delask:{file_id}:{page}"
                 )
             ])
