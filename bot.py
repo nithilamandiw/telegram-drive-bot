@@ -6,9 +6,10 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 from pydrive2.auth import GoogleAuth
 from pydrive2.drive import GoogleDrive
+from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
-# ── Load environment ─────────────────────
+# ── Load env ─────────────────────────────
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID", "root")
@@ -16,15 +17,14 @@ DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID", "root")
 logging.basicConfig(level=logging.INFO)
 
 # ── Google Drive Auth ────────────────────
-def get_drive():
+def get_drive_service():
     gauth = GoogleAuth(settings_file="settings.yaml")
 
-    # Load saved credentials (VPS)
     if os.path.exists("saved_creds.json"):
         gauth.LoadCredentialsFile("saved_creds.json")
 
     if gauth.credentials is None:
-        print("⚠️ First-time auth required (run locally)")
+        print("⚠️ Run auth locally first")
         gauth.CommandLineAuth()
     elif gauth.access_token_expired:
         gauth.Refresh()
@@ -33,14 +33,13 @@ def get_drive():
 
     gauth.SaveCredentialsFile("saved_creds.json")
 
-    return GoogleDrive(gauth)
+    # ✅ FIX: build correct Drive API service
+    return build("drive", "v3", credentials=gauth.credentials)
 
-drive = get_drive()
+drive_service = get_drive_service()
 
-# ── Upload with REAL progress ────────────
+# ── Upload with PRO progress ─────────────
 def upload_to_drive_with_progress(filepath, filename, progress_message):
-    service = drive.auth.service
-
     file_metadata = {
         "name": filename,
         "parents": [DRIVE_FOLDER_ID]
@@ -48,7 +47,7 @@ def upload_to_drive_with_progress(filepath, filename, progress_message):
 
     media = MediaFileUpload(filepath, resumable=True)
 
-    request = service.files().create(
+    request = drive_service.files().create(   # ✅ CORRECT API
         body=file_metadata,
         media_body=media,
         fields="id"
@@ -75,7 +74,6 @@ def upload_to_drive_with_progress(filepath, filename, progress_message):
             remaining_mb = total_mb - uploaded_mb
             eta = remaining_mb / speed if speed > 0 else 0
 
-            # Update message
             progress_message.edit_text(
                 f"☁️ Uploading... {progress}%\n"
                 f"{uploaded_mb:.2f} / {total_mb:.2f} MB\n"
@@ -85,7 +83,7 @@ def upload_to_drive_with_progress(filepath, filename, progress_message):
     file_id = response.get("id")
     return f"https://drive.google.com/file/d/{file_id}/view"
 
-# ── Handle incoming files ────────────────
+# ── Handle files ─────────────────────────
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
 
