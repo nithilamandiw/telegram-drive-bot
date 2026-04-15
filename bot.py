@@ -215,7 +215,7 @@ async def clone_drive_file(context: ContextTypes.DEFAULT_TYPE, source_file_id: s
         service.files().copy(
             fileId=source_file_id,
             body={
-                "name": f"Copied_{original_name}",
+                "name": original_name,
                 "parents": [DRIVE_FOLDER_ID]
             },
             fields="id,name"
@@ -228,8 +228,7 @@ async def clone_drive_file(context: ContextTypes.DEFAULT_TYPE, source_file_id: s
 
     return {
         "id": new_id,
-        "name": copied.get("name", f"Copied_{original_name}"),
-        "link": clean_drive_file_url(new_id),
+        "name": copied.get("name", original_name),
     }
 
 
@@ -675,6 +674,30 @@ async def build_upload_action_keyboard(context: ContextTypes.DEFAULT_TYPE, servi
             InlineKeyboardButton("🗑 Delete", callback_data=make_callback_data(context, "delete_upload", file_id=file_id))
         ]
     ])
+
+
+async def send_uploaded_ui(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    file_id: str,
+    filename: str,
+    message_to_edit=None,
+):
+    drive = context.bot_data.get("drive")
+    http = drive.auth.Get_Http_Object()
+    service = build("drive", "v3", http=http, cache_discovery=False)
+
+    # Keep link generation centralized for all uploaded/cloned success UI.
+    _ = clean_drive_file_url(file_id)
+    upload_keyboard = await build_upload_action_keyboard(context, service, file_id)
+
+    if message_to_edit is not None:
+        await message_to_edit.edit_text("✅ Uploaded!", reply_markup=upload_keyboard)
+        return
+
+    target_message = update.message if update.message else (update.callback_query.message if update.callback_query else None)
+    if target_message:
+        await target_message.reply_text("✅ Uploaded!", reply_markup=upload_keyboard)
 
 
 async def check_duplicate(service, filename: str, file_size: int | None):
@@ -2154,11 +2177,13 @@ async def run_transfer_pipeline(
                 should_cancel=is_cancelled
             )
 
-        http = drive.auth.Get_Http_Object()
-        service = build("drive", "v3", http=http, cache_discovery=False)
-        upload_keyboard = await build_upload_action_keyboard(context, service, uploaded_file_id)
-
-        await progress_msg.edit_text("✅ Uploaded!", reply_markup=upload_keyboard)
+        await send_uploaded_ui(
+            update,
+            context,
+            uploaded_file_id,
+            filename,
+            message_to_edit=progress_msg,
+        )
         try:
             update_upload_analytics(filename, known_size)
         except Exception as e:
@@ -2249,11 +2274,12 @@ async def handle_drive_link_message(update: Update, context: ContextTypes.DEFAUL
     status_msg = await message.reply_text("📎 Cloning Google Drive file...")
     try:
         cloned = await clone_drive_file(context, file_id)
-        await status_msg.edit_text(
-            "✅ File cloned successfully\n"
-            f"Name: {cloned['name']}\n"
-            f"Link: {cloned['link']}",
-            disable_web_page_preview=True
+        await send_uploaded_ui(
+            update,
+            context,
+            cloned["id"],
+            cloned.get("name", "cloned_file"),
+            message_to_edit=status_msg,
         )
     except HttpError as e:
         logger.error(f"Drive clone failed (API): {e}")
