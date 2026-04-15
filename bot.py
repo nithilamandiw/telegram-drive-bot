@@ -25,6 +25,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+def progress_bar(percent: int, width: int = 12) -> str:
+    percent = max(0, min(100, percent))
+    filled = int(width * percent / 100)
+    return "█" * filled + "░" * (width - filled)
+
+
 def fix_volume_permissions():
     try:
         subprocess.run(
@@ -260,10 +267,12 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         done_mb = done / (1024 * 1024)
         total_mb = total / (1024 * 1024)
         try:
+            bar = progress_bar(percent)
             await progress_msg.edit_text(
                 f"{emoji} {filename}\n"
                 f"📦 {size_mb} MB\n\n"
                 f"⬇️ Downloading... {percent}%\n"
+                f"{bar}\n"
                 f"{done_mb:.2f}/{total_mb:.2f} MB"
             )
         except Exception:
@@ -279,10 +288,12 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         done_mb = done / (1024 * 1024)
         total_mb = total / (1024 * 1024)
         try:
+            bar = progress_bar(percent)
             await progress_msg.edit_text(
                 f"{emoji} {filename}\n"
                 f"📦 {size_mb} MB\n\n"
                 f"☁️ Uploading to Google Drive... {percent}%\n"
+                f"{bar}\n"
                 f"{done_mb:.2f}/{total_mb:.2f} MB"
             )
         except Exception:
