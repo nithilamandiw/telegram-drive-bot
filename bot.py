@@ -1,36 +1,30 @@
 import os
-import logging
-import time
 import requests
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
+
 from pydrive2.auth import GoogleAuth
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
+from pydrive2.drive import GoogleDrive
 
-# ── Load env ─────────────────────────────
+# Load env
 load_dotenv()
+
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID", "root")
+DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")
 
-logging.basicConfig(level=logging.INFO)
+# ---------------- GOOGLE DRIVE ---------------- #
 
-# ── Progress bar ─────────────────────────
-def progress_bar(progress, length=20):
-    filled = int(length * progress // 100)
-    return "█" * filled + "░" * (length - filled)
-
-# ── Google Drive Auth ────────────────────
-def get_drive_service():
+def get_drive():
     gauth = GoogleAuth(settings_file="settings.yaml")
 
+    # Load saved creds (for VPS)
     if os.path.exists("saved_creds.json"):
         gauth.LoadCredentialsFile("saved_creds.json")
 
     if gauth.credentials is None:
-        print("⚠️ Run auth locally first")
-        gauth.CommandLineAuth()
+        raise Exception("❌ No Google credentials found")
+
     elif gauth.access_token_expired:
         gauth.Refresh()
     else:
@@ -38,146 +32,83 @@ def get_drive_service():
 
     gauth.SaveCredentialsFile("saved_creds.json")
 
-    return build("drive", "v3", credentials=gauth.credentials)
+    return GoogleDrive(gauth)
 
-drive_service = get_drive_service()
 
-# ── Upload with PRO UI ───────────────────
-def upload_to_drive_with_progress(filepath, filename, progress_message):
-    file_metadata = {
-        "name": filename,
-        "parents": [DRIVE_FOLDER_ID]
-    }
+drive = get_drive()
 
-    media = MediaFileUpload(
-        filepath,
-        resumable=True,
-        chunksize=5 * 1024 * 1024
-    )
+# ---------------- DOWNLOAD FROM TELEGRAM ---------------- #
 
-    request = drive_service.files().create(
-        body=file_metadata,
-        media_body=media,
-        fields="id"
-    )
-
-    response = None
-    start_time = time.time()
-    last_update = 0
-
-    while response is None:
-        try:
-            status, response = request.next_chunk()
-        except Exception as e:
-            print("Retrying...", e)
-            time.sleep(2)
-            continue
-
-        if status:
-            progress = int(status.progress() * 100)
-
-            uploaded_bytes = status.resumable_progress
-            total_bytes = status.total_size or 1
-
-            uploaded_mb = uploaded_bytes / (1024 * 1024)
-            total_mb = total_bytes / (1024 * 1024)
-
-            elapsed = time.time() - start_time
-            speed = uploaded_mb / elapsed if elapsed > 0 else 0
-
-            remaining_mb = total_mb - uploaded_mb
-            eta = remaining_mb / speed if speed > 0 else 0
-
-            # limit updates (1 sec)
-            if time.time() - last_update > 1:
-                last_update = time.time()
-
-                bar = progress_bar(progress)
-
-                progress_message.edit_text(
-                    f"☁️ Uploading...\n"
-                    f"{bar} {progress}%\n"
-                    f"{uploaded_mb:.2f} / {total_mb:.2f} MB\n"
-                    f"⚡ {speed:.2f} MB/s | ⏱ {int(eta)}s left"
-                )
-
-    file_id = response.get("id")
-    return f"https://drive.google.com/file/d/{file_id}/view"
-
-# ── Handle files ─────────────────────────
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
 
-    if message.document:
-        file_id = message.document.file_id
-        filename = message.document.file_name
-        file_size = message.document.file_size
-
-    elif message.video:
-        file_id = message.video.file_id
-        filename = message.video.file_name or "video.mp4"
-        file_size = message.video.file_size
-
-    elif message.photo:
-        file_id = message.photo[-1].file_id
-        filename = f"photo_{file_id}.jpg"
-        file_size = message.photo[-1].file_size
-
-    else:
-        await message.reply_text("Send a file/photo/video.")
+    if not message.document:
         return
 
-    total_mb = file_size / (1024 * 1024)
+    file_id = message.document.file_id
+    file_name = message.document.file_name
+    file_size = message.document.file_size
 
-    # ── Download ──
-    download_msg = await message.reply_text(
-        f"⬇️ Downloading...\n0 / {total_mb:.2f} MB"
-    )
+    local_path = f"./{file_name}"
 
-    local_path = f"/tmp/{filename}"
+    await message.reply_text(f"⬇️ Downloading: {file_name}")
 
-    file_info = await context.bot.get_file(file_id)
-    file_path = file_info.file_path
-    download_url = f"http://localhost:8081/file/bot{TELEGRAM_TOKEN}/{file_path}"
+    # 🔥 DIRECT LOCAL API DOWNLOAD (NO LIMIT)
+    download_url = f"http://localhost:8081/file/bot{TELEGRAM_TOKEN}/{file_id}"
+
+    downloaded = 0
+
+    progress_msg = await message.reply_text("Starting download...")
 
     with requests.get(download_url, stream=True) as r:
         with open(local_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1024 * 1024):
+            for chunk in r.iter_content(chunk_size=1024 * 1024):  # 1MB chunks
                 if chunk:
                     f.write(chunk)
+                    downloaded += len(chunk)
 
-    await download_msg.edit_text(
-        f"✅ Downloaded {total_mb:.2f} MB"
-    )
+                    percent = int(downloaded * 100 / file_size)
+                    mb_done = downloaded / (1024 * 1024)
+                    mb_total = file_size / (1024 * 1024)
 
-    # ── Upload ──
-    upload_msg = await message.reply_text("☁️ Starting upload...")
+                    bar = "█" * (percent // 10) + "░" * (10 - percent // 10)
 
-    try:
-        link = upload_to_drive_with_progress(local_path, filename, upload_msg)
+                    try:
+                        await progress_msg.edit_text(
+                            f"⬇️ Downloading...\n{bar} {percent}%\n{mb_done:.2f}/{mb_total:.2f} MB"
+                        )
+                    except:
+                        pass
 
-        await upload_msg.edit_text(
-            f"✅ Uploaded!\n\n🔗 {link}"
-        )
+    await progress_msg.edit_text("☁️ Uploading to Google Drive...")
 
-    except Exception as e:
-        await message.reply_text(f"❌ Upload failed: {str(e)}")
+    # ---------------- UPLOAD TO DRIVE ---------------- #
 
-    finally:
-        if os.path.exists(local_path):
-            os.remove(local_path)
+    gfile = drive.CreateFile({
+        "title": file_name,
+        "parents": [{"id": DRIVE_FOLDER_ID}]
+    })
 
-# ── Run bot ─────────────────────────────
-if __name__ == "__main__":
-    app = ApplicationBuilder()\
-        .token(TELEGRAM_TOKEN)\
-        .base_url("http://localhost:8081/bot")\
-        .build()
+    gfile.SetContentFile(local_path)
+    gfile.Upload()
 
-    app.add_handler(MessageHandler(
-        filters.Document.ALL | filters.VIDEO | filters.PHOTO,
-        handle_file
-    ))
+    link = gfile["alternateLink"]
 
-    print("🤖 Bot is running...")
-    app.run_polling()
+    await message.reply_text(f"✅ Uploaded!\n🔗 {link}")
+
+    # Cleanup
+    os.remove(local_path)
+
+
+# ---------------- START BOT ---------------- #
+
+app = ApplicationBuilder() \
+    .token(TELEGRAM_TOKEN) \
+    .base_url("http://localhost:8081/bot") \
+    .build()
+
+app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
+
+print("🤖 Bot is running...")
+
+app.run_polling()
