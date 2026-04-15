@@ -14,6 +14,7 @@ from pydrive2.drive import GoogleDrive
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID", "root")
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 
 # Local Bot API server URL (running via Docker)
 LOCAL_API_URL = "http://localhost:8081/bot"
@@ -220,6 +221,12 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     drive = context.bot_data.get("drive")
     upload_semaphore = context.bot_data.get("upload_semaphore")
+
+    # Access control: only allow the owner to use file handlers.
+    user = update.effective_user
+    if not user or user.id != OWNER_ID:
+        await message.reply_text("❌ Unauthorized access")
+        return
 
     # Detect file type
     if message.document:
