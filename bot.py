@@ -5,6 +5,7 @@ import asyncio
 import httpx
 from dotenv import load_dotenv
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaFileUpload
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, CallbackQueryHandler, filters, ContextTypes
@@ -303,20 +304,31 @@ async def build_files_page(context: ContextTypes.DEFAULT_TYPE, page: int, page_s
     items = all_items[start:end]
 
     lines = [f"📂 Latest files in Drive folder\nPage {page}/{total_pages}\n"]
+    keyboard_rows = []
     for idx, item in enumerate(items, start=start + 1):
+        file_id = item.get("id", "")
         name = item.get("name", "Unnamed file")
         link = item.get("webViewLink")
         if link:
             lines.append(f"{idx}. {name}\n   🔗 {link}")
         else:
             lines.append(f"{idx}. {name}")
+        if file_id:
+            keyboard_rows.append([
+                InlineKeyboardButton(
+                    f"🗑 Delete {idx}",
+                    callback_data=f"delask:{file_id}:{page}"
+                )
+            ])
 
     buttons = []
     if page > 1:
         buttons.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"files_page_{page - 1}"))
     if page < total_pages:
         buttons.append(InlineKeyboardButton("➡️ Next", callback_data=f"files_page_{page + 1}"))
-    keyboard = InlineKeyboardMarkup([buttons]) if buttons else None
+    if buttons:
+        keyboard_rows.append(buttons)
+    keyboard = InlineKeyboardMarkup(keyboard_rows) if keyboard_rows else None
 
     return "\n".join(lines), keyboard
 
@@ -342,6 +354,67 @@ async def files_pagination_callback(update: Update, context: ContextTypes.DEFAUL
     except Exception as e:
         logger.error(f"Files pagination failed: {e}")
         await query.answer("Failed to load page", show_alert=True)
+
+
+async def files_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = update.effective_user
+
+    if not user or user.id != OWNER_ID:
+        await query.answer("Unauthorized", show_alert=True)
+        return
+
+    try:
+        data = query.data or ""
+
+        if data.startswith("delask:"):
+            _, file_id, page_str = data.split(":", 2)
+            page = int(page_str)
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("✅ Yes, delete", callback_data=f"delyes:{file_id}:{page}"),
+                    InlineKeyboardButton("❌ No", callback_data=f"delno:{page}")
+                ]
+            ])
+            await query.edit_message_text(
+                "⚠️ Are you sure you want to delete this file from Google Drive?",
+                reply_markup=keyboard
+            )
+            await query.answer()
+            return
+
+        if data.startswith("delno:"):
+            _, page_str = data.split(":", 1)
+            page = int(page_str)
+            text, keyboard = await build_files_page(context, page=page, page_size=10)
+            await query.edit_message_text(text=text, reply_markup=keyboard)
+            await query.answer("Cancelled")
+            return
+
+        if data.startswith("delyes:"):
+            _, file_id, page_str = data.split(":", 2)
+            page = int(page_str)
+
+            drive = context.bot_data.get("drive")
+            http = drive.auth.Get_Http_Object()
+            service = build("drive", "v3", http=http, cache_discovery=False)
+
+            await asyncio.to_thread(
+                service.files().delete(fileId=file_id).execute
+            )
+
+            text, keyboard = await build_files_page(context, page=page, page_size=10)
+            await query.edit_message_text(text=text, reply_markup=keyboard)
+            await query.answer("✅ File deleted")
+            return
+
+        await query.answer()
+    except HttpError as e:
+        logger.error(f"Delete failed (Drive API): {e}")
+        await query.answer("❌ Delete failed (not found or API error)", show_alert=True)
+    except Exception as e:
+        logger.error(f"Delete callback failed: {e}")
+        await query.answer("❌ Delete failed", show_alert=True)
 
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -534,6 +607,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("storage", storage))
     app.add_handler(CommandHandler("files", files))
+    app.add_handler(CallbackQueryHandler(files_delete_callback, pattern=r"^(delask|delyes|delno):"))
     app.add_handler(CallbackQueryHandler(files_pagination_callback, pattern=r"^files_page_\d+$"))
     app.add_handler(MessageHandler(
         filters.Document.ALL | filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE,
