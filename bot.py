@@ -13,7 +13,8 @@ DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID", "root")
 
 # Local Bot API server URL (running via Docker)
 LOCAL_API_URL = "http://localhost:8081/bot"
-LOCAL_API_DIR = "/var/lib/telegram-bot-api"  # matches --dir in your Docker run command
+LOCAL_API_DIR = "/var/lib/telegram-bot-api"  # path inside container
+VOLUME_HOST_PATH = "/var/lib/docker/volumes/telegram-data/_data"  # path on host
 
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -53,7 +54,7 @@ def upload_to_drive(drive, filepath, filename):
 
 
 async def download_via_local_api(file_id: str, local_path: str) -> bool:
-    """Download file using local Bot API server — supports files up to 2GB."""
+    """Read file directly from the Docker volume on disk — no HTTP needed."""
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
@@ -67,30 +68,23 @@ async def download_via_local_api(file_id: str, local_path: str) -> bool:
             return False
 
         file_path = data["result"]["file_path"]
+        # file_path is like: /var/lib/telegram-bot-api/1875002742:.../documents/file_3.psd
+        # Remap it to the host volume path
+        host_file_path = file_path.replace(LOCAL_API_DIR, VOLUME_HOST_PATH, 1)
 
-        # The local API returns an absolute path like:
-        #   /var/lib/telegram-bot-api/1875002742:.../documents/file_3.psd
-        # The server only serves the part AFTER --dir, so strip that prefix.
-        if file_path.startswith(LOCAL_API_DIR):
-            relative_path = file_path[len(LOCAL_API_DIR):].lstrip("/")
-        else:
-            relative_path = file_path.lstrip("/")
+        logger.info(f"Reading directly from volume: {host_file_path}")
 
-        download_url = f"http://localhost:8081/file/bot{TELEGRAM_TOKEN}/{relative_path}"
-        logger.info(f"Downloading from local API: {download_url}")
+        if not os.path.exists(host_file_path):
+            logger.warning(f"File not found on host at: {host_file_path}")
+            return False
 
-        async with httpx.AsyncClient(timeout=600) as client:
-            async with client.stream("GET", download_url) as response:
-                response.raise_for_status()
-                with open(local_path, "wb") as f:
-                    async for chunk in response.aiter_bytes(chunk_size=1024 * 1024):
-                        f.write(chunk)
-
-        logger.info(f"✅ Downloaded via local API: {local_path}")
+        import shutil
+        shutil.copy2(host_file_path, local_path)
+        logger.info(f"✅ Copied from volume: {local_path}")
         return True
 
     except Exception as e:
-        logger.warning(f"Local API download failed: {e}")
+        logger.warning(f"Local volume read failed: {e}")
         return False
 
 
