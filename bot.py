@@ -35,6 +35,23 @@ class TransferCancelled(Exception):
     pass
 
 
+def _callback_store(context: ContextTypes.DEFAULT_TYPE):
+    return context.bot_data.setdefault("callback_payloads", {})
+
+
+def make_callback_data(context: ContextTypes.DEFAULT_TYPE, action: str, **payload) -> str:
+    token = uuid.uuid4().hex[:16]
+    _callback_store(context)[token] = {"action": action, **payload}
+    return f"cb_{token}"
+
+
+def resolve_callback_data(context: ContextTypes.DEFAULT_TYPE, data: str):
+    if not data or not data.startswith("cb_"):
+        return None
+    token = data[3:]
+    return _callback_store(context).get(token)
+
+
 def progress_bar(percent: int, width: int = 12) -> str:
     percent = max(0, min(100, percent))
     filled = int(width * percent / 100)
@@ -82,19 +99,19 @@ async def is_file_public(service, file_id: str) -> bool:
     return await get_public_permission_id(service, file_id) is not None
 
 
-async def build_upload_action_keyboard(service, file_id: str):
+async def build_upload_action_keyboard(context: ContextTypes.DEFAULT_TYPE, service, file_id: str):
     is_public = await is_file_public(service, file_id)
     toggle_button = (
-        InlineKeyboardButton("🔒 Make Private", callback_data=f"private_{file_id}")
+        InlineKeyboardButton("🔒 Make Private", callback_data=make_callback_data(context, "private", file_id=file_id))
         if is_public else
-        InlineKeyboardButton("🌐 Make Public", callback_data=f"public_{file_id}")
+        InlineKeyboardButton("🌐 Make Public", callback_data=make_callback_data(context, "public", file_id=file_id))
     )
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔗 Open File", url=clean_drive_file_url(file_id))],
         [toggle_button],
         [
-            InlineKeyboardButton("✏️ Rename", callback_data=f"rename_{file_id}"),
-            InlineKeyboardButton("🗑 Delete", callback_data=f"delete_{file_id}")
+            InlineKeyboardButton("✏️ Rename", callback_data=make_callback_data(context, "rename", file_id=file_id)),
+            InlineKeyboardButton("🗑 Delete", callback_data=make_callback_data(context, "delete_upload", file_id=file_id))
         ]
     ])
 
@@ -407,12 +424,18 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if file_id:
                 label = name if len(name) <= 40 else f"{name[:37]}..."
                 keyboard_rows.append([
-                    InlineKeyboardButton(label, callback_data=f"file_{file_id}")
+                    InlineKeyboardButton(
+                        label,
+                        callback_data=make_callback_data(context, "open_file_search_suggestion", file_id=file_id, session_id=session_id)
+                    )
                 ])
 
         if has_more:
             keyboard_rows.append([
-                InlineKeyboardButton("📚 View all results", callback_data=f"search:{session_id}:1")
+                InlineKeyboardButton(
+                    "📚 View all results",
+                    callback_data=make_callback_data(context, "search_page", session_id=session_id, page=1)
+                )
             ])
 
         sent = await message.reply_text(
@@ -461,15 +484,15 @@ async def build_files_page(context: ContextTypes.DEFAULT_TYPE, page: int, page_s
             keyboard_rows.append([
                 InlineKeyboardButton(
                     display_name,
-                    callback_data=f"file_{file_id}_{page}"
+                    callback_data=make_callback_data(context, "open_file_from_files", file_id=file_id, page=page)
                 )
             ])
 
     buttons = []
     if page > 1:
-        buttons.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"page_{page - 1}"))
+        buttons.append(InlineKeyboardButton("⬅️ Previous", callback_data=make_callback_data(context, "files_page", page=page - 1)))
     if page < total_pages:
-        buttons.append(InlineKeyboardButton("➡️ Next", callback_data=f"page_{page + 1}"))
+        buttons.append(InlineKeyboardButton("➡️ Next", callback_data=make_callback_data(context, "files_page", page=page + 1)))
     if buttons:
         keyboard_rows.append(buttons)
     keyboard = InlineKeyboardMarkup(keyboard_rows) if keyboard_rows else None
@@ -531,15 +554,21 @@ async def build_search_page(context: ContextTypes.DEFAULT_TYPE, session_id: str,
             keyboard_rows.append([
                 InlineKeyboardButton(
                     display_name,
-                    callback_data=f"sfile:{file_id}:{session_id}:{page}"
+                    callback_data=make_callback_data(
+                        context,
+                        "open_file_from_search_results",
+                        file_id=file_id,
+                        session_id=session_id,
+                        page=page
+                    )
                 )
             ])
 
     nav = []
     if page > 1:
-        nav.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"search:{session_id}:{page - 1}"))
+        nav.append(InlineKeyboardButton("⬅️ Previous", callback_data=make_callback_data(context, "search_page", session_id=session_id, page=page - 1)))
     if next_token:
-        nav.append(InlineKeyboardButton("➡️ Next", callback_data=f"search:{session_id}:{page + 1}"))
+        nav.append(InlineKeyboardButton("➡️ Next", callback_data=make_callback_data(context, "search_page", session_id=session_id, page=page + 1)))
     if nav:
         keyboard_rows.append(nav)
 
@@ -572,13 +601,13 @@ async def file_view(
     clean_link = clean_drive_file_url(details["id"])
     public_state = await is_file_public(service, file_id)
     toggle_button = (
-        InlineKeyboardButton("🔒 Make Private", callback_data=f"private_{file_id}")
+        InlineKeyboardButton("🔒 Make Private", callback_data=make_callback_data(context, "private", file_id=file_id))
         if public_state else
-        InlineKeyboardButton("🌐 Make Public", callback_data=f"public_{file_id}")
+        InlineKeyboardButton("🌐 Make Public", callback_data=make_callback_data(context, "public", file_id=file_id))
     )
 
-    back_callback = back_callback or f"back_{page}"
-    delete_callback = delete_callback or f"delpage_{file_id}_{page}"
+    back_callback = back_callback or make_callback_data(context, "files_page", page=page)
+    delete_callback = delete_callback or make_callback_data(context, "delete_from_files", file_id=file_id, page=page)
     context.user_data["files_current_view"] = {
         "chat_id": query.message.chat_id if query.message else None,
         "message_id": query.message.message_id if query.message else None,
@@ -596,7 +625,7 @@ async def file_view(
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("🔗 Open File", url=clean_link)],
         [toggle_button],
-        [InlineKeyboardButton("✏️ Rename", callback_data=f"rename_{file_id}")],
+        [InlineKeyboardButton("✏️ Rename", callback_data=make_callback_data(context, "rename", file_id=file_id))],
         [InlineKeyboardButton("🗑 Delete", callback_data=delete_callback)],
         [InlineKeyboardButton("🔙 Back", callback_data=back_callback)]
     ])
@@ -628,12 +657,12 @@ async def refresh_file_view_message(
     clean_link = clean_drive_file_url(details["id"])
     public_state = await is_file_public(service, file_id)
     toggle_button = (
-        InlineKeyboardButton("🔒 Make Private", callback_data=f"private_{file_id}")
+        InlineKeyboardButton("🔒 Make Private", callback_data=make_callback_data(context, "private", file_id=file_id))
         if public_state else
-        InlineKeyboardButton("🌐 Make Public", callback_data=f"public_{file_id}")
+        InlineKeyboardButton("🌐 Make Public", callback_data=make_callback_data(context, "public", file_id=file_id))
     )
-    back_callback = back_callback or f"back_{page}"
-    delete_callback = delete_callback or f"delpage_{file_id}_{page}"
+    back_callback = back_callback or make_callback_data(context, "files_page", page=page)
+    delete_callback = delete_callback or make_callback_data(context, "delete_from_files", file_id=file_id, page=page)
 
     text = (
         f"📄 {name}\n"
@@ -643,7 +672,7 @@ async def refresh_file_view_message(
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("🔗 Open File", url=clean_link)],
         [toggle_button],
-        [InlineKeyboardButton("✏️ Rename", callback_data=f"rename_{file_id}")],
+        [InlineKeyboardButton("✏️ Rename", callback_data=make_callback_data(context, "rename", file_id=file_id))],
         [InlineKeyboardButton("🗑 Delete", callback_data=delete_callback)],
         [InlineKeyboardButton("🔙 Back", callback_data=back_callback)]
     ])
@@ -666,142 +695,122 @@ async def files_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     try:
-        data = query.data or ""
+        payload = resolve_callback_data(context, query.data or "")
+        if not payload:
+            await query.answer("Action expired. Please try again.", show_alert=True)
+            return
 
-        if data.startswith("page_"):
-            page = int(data.replace("page_", ""))
+        action = payload.get("action")
+
+        if action == "files_page":
+            page = int(payload.get("page", 1))
             text, keyboard = await build_files_page(context, page=page, page_size=10)
             await query.edit_message_text(text=text, reply_markup=keyboard)
             await query.answer()
             return
 
-        if data.startswith("back_"):
-            page = int(data.replace("back_", ""))
-            text, keyboard = await build_files_page(context, page=page, page_size=10)
-            await query.edit_message_text(text=text, reply_markup=keyboard)
-            await query.answer()
-            return
-
-        if data.startswith("search:"):
-            _, session_id, page_str = data.split(":", 2)
-            page = int(page_str)
+        if action == "search_page":
+            session_id = str(payload.get("session_id"))
+            page = int(payload.get("page", 1))
             text, keyboard = await build_search_page(context, session_id=session_id, page=page, page_size=10)
             await query.edit_message_text(text=text, reply_markup=keyboard, disable_web_page_preview=True)
             await query.answer()
             return
 
-        if data.startswith("sback:"):
-            _, session_id, page_str = data.split(":", 2)
-            page = int(page_str)
-            text, keyboard = await build_search_page(context, session_id=session_id, page=page, page_size=10)
-            await query.edit_message_text(text=text, reply_markup=keyboard, disable_web_page_preview=True)
+        if action == "open_file_from_files":
+            file_id = payload.get("file_id")
+            page = int(payload.get("page", 1))
+            await file_view(update, context, file_id=file_id, page=page)
             await query.answer()
             return
 
-        if data.startswith("file_"):
-            payload = data[len("file_"):]
-
-            # /files flow: file_<fileId>_<page>
-            # /search suggestion flow: file_<fileId>
-            page = 1
-            file_id = payload
-            if "_" in payload:
-                possible_file_id, possible_page = payload.rsplit("_", 1)
-                if possible_page.isdigit():
-                    file_id = possible_file_id
-                    page = int(possible_page)
-                    await file_view(update, context, file_id=file_id, page=page)
-                    await query.answer()
-                    return
-
-            # Reuse file view for suggestion clicks, and wire back to paged search results.
-            session_id = None
-            if query.message:
-                session_id = context.user_data.get("search_message_sessions", {}).get(query.message.message_id)
-            if session_id:
-                await file_view(
-                    update,
-                    context,
-                    file_id=file_id,
-                    page=1,
-                    back_callback=f"search:{session_id}:1",
-                    delete_callback=f"sdel:{file_id}:{session_id}:1"
-                )
-            else:
-                await file_view(update, context, file_id=file_id, page=1)
+        if action == "open_file_search_suggestion":
+            file_id = payload.get("file_id")
+            session_id = str(payload.get("session_id"))
+            await file_view(
+                update,
+                context,
+                file_id=file_id,
+                page=1,
+                back_callback=make_callback_data(context, "search_page", session_id=session_id, page=1),
+                delete_callback=make_callback_data(context, "delete_from_search", file_id=file_id, session_id=session_id, page=1)
+            )
             await query.answer()
             return
 
-        if data.startswith("sfile:"):
-            _, file_id, session_id, page_str = data.split(":", 3)
-            page = int(page_str)
+        if action == "open_file_from_search_results":
+            file_id = payload.get("file_id")
+            session_id = str(payload.get("session_id"))
+            page = int(payload.get("page", 1))
             await file_view(
                 update,
                 context,
                 file_id=file_id,
                 page=page,
-                back_callback=f"sback:{session_id}:{page}",
-                delete_callback=f"sdel:{file_id}:{session_id}:{page}"
+                back_callback=make_callback_data(context, "search_page", session_id=session_id, page=page),
+                delete_callback=make_callback_data(context, "delete_from_search", file_id=file_id, session_id=session_id, page=page)
             )
             await query.answer()
             return
 
-        if data.startswith("delpage_"):
-            payload = data[len("delpage_"):]
-            file_id, page_str = payload.rsplit("_", 1)
-            page = int(page_str)
+        if action == "delete_from_files":
+            file_id = payload.get("file_id")
+            page = int(payload.get("page", 1))
             drive = context.bot_data.get("drive")
             http = drive.auth.Get_Http_Object()
             service = build("drive", "v3", http=http, cache_discovery=False)
-
-            await asyncio.to_thread(
-                service.files().delete(fileId=file_id).execute
-            )
+            await asyncio.to_thread(service.files().delete(fileId=file_id).execute)
             text, keyboard = await build_files_page(context, page=page, page_size=10)
             await query.edit_message_text(text=text, reply_markup=keyboard)
             await query.answer("✅ File deleted")
             return
 
-        if data.startswith("sdel:"):
-            _, file_id, session_id, page_str = data.split(":", 3)
-            page = int(page_str)
+        if action == "delete_from_search":
+            file_id = payload.get("file_id")
+            session_id = str(payload.get("session_id"))
+            page = int(payload.get("page", 1))
             drive = context.bot_data.get("drive")
             http = drive.auth.Get_Http_Object()
             service = build("drive", "v3", http=http, cache_discovery=False)
-            await asyncio.to_thread(
-                service.files().delete(fileId=file_id).execute
-            )
+            await asyncio.to_thread(service.files().delete(fileId=file_id).execute)
             text, keyboard = await build_search_page(context, session_id=session_id, page=page, page_size=10)
             await query.edit_message_text(text=text, reply_markup=keyboard, disable_web_page_preview=True)
             await query.answer("✅ File deleted")
             return
 
-        if data.startswith("delete_"):
-            payload = data[len("delete_"):]
+        if action == "delete_upload":
+            file_id = payload.get("file_id")
             drive = context.bot_data.get("drive")
             http = drive.auth.Get_Http_Object()
             service = build("drive", "v3", http=http, cache_discovery=False)
-
-            await asyncio.to_thread(
-                service.files().delete(fileId=payload).execute
-            )
+            await asyncio.to_thread(service.files().delete(fileId=file_id).execute)
             await query.edit_message_text("✅ File deleted from Google Drive.")
             await query.answer("✅ File deleted")
             return
 
-        if data.startswith("public_"):
-            file_id = data[len("public_"):]
+        if action in {"public", "private"}:
+            file_id = payload.get("file_id")
             drive = context.bot_data.get("drive")
             http = drive.auth.Get_Http_Object()
             service = build("drive", "v3", http=http, cache_discovery=False)
 
-            if not await is_file_public(service, file_id):
-                await asyncio.to_thread(
-                    service.permissions().create(
-                        fileId=file_id,
-                        body={"type": "anyone", "role": "reader"}
-                    ).execute
-                )
+            if action == "public":
+                if not await is_file_public(service, file_id):
+                    await asyncio.to_thread(
+                        service.permissions().create(
+                            fileId=file_id,
+                            body={"type": "anyone", "role": "reader"}
+                        ).execute
+                    )
+            else:
+                perm_id = await get_public_permission_id(service, file_id)
+                if perm_id:
+                    await asyncio.to_thread(
+                        service.permissions().delete(
+                            fileId=file_id,
+                            permissionId=perm_id
+                        ).execute
+                    )
 
             current_view = context.user_data.get("files_current_view", {})
             if current_view.get("file_id") == file_id and current_view.get("message_id") == (query.message.message_id if query.message else None):
@@ -815,47 +824,15 @@ async def files_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
                     delete_callback=current_view.get("delete_callback")
                 )
             else:
-                keyboard = await build_upload_action_keyboard(service, file_id)
-                await query.edit_message_text("🌐 File is now public", reply_markup=keyboard)
-            await query.answer("🌐 File is now public")
+                keyboard = await build_upload_action_keyboard(context, service, file_id)
+                msg = "🌐 File is now public" if action == "public" else "🔒 File is now private"
+                await query.edit_message_text(msg, reply_markup=keyboard)
+            await query.answer("🌐 File is now public" if action == "public" else "🔒 File is now private")
             return
 
-        if data.startswith("private_"):
-            file_id = data[len("private_"):]
-            drive = context.bot_data.get("drive")
-            http = drive.auth.Get_Http_Object()
-            service = build("drive", "v3", http=http, cache_discovery=False)
-
-            perm_id = await get_public_permission_id(service, file_id)
-            if perm_id:
-                await asyncio.to_thread(
-                    service.permissions().delete(
-                        fileId=file_id,
-                        permissionId=perm_id
-                    ).execute
-                )
-
-            current_view = context.user_data.get("files_current_view", {})
-            if current_view.get("file_id") == file_id and current_view.get("message_id") == (query.message.message_id if query.message else None):
-                await refresh_file_view_message(
-                    context=context,
-                    chat_id=current_view["chat_id"],
-                    message_id=current_view["message_id"],
-                    file_id=file_id,
-                    page=int(current_view.get("page", 1)),
-                    back_callback=current_view.get("back_callback"),
-                    delete_callback=current_view.get("delete_callback")
-                )
-            else:
-                keyboard = await build_upload_action_keyboard(service, file_id)
-                await query.edit_message_text("🔒 File is now private", reply_markup=keyboard)
-            await query.answer("🔒 File is now private")
-            return
-
-        if data.startswith("rename_"):
-            file_id = data[len("rename_"):]
+        if action == "rename":
+            file_id = payload.get("file_id")
             context.user_data["rename_file_id"] = file_id
-
             current_view = context.user_data.get("files_current_view", {})
             rename_return = None
             if query.message and current_view.get("file_id") == file_id and current_view.get("message_id") == query.message.message_id:
@@ -868,12 +845,11 @@ async def files_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
                     "delete_callback": current_view.get("delete_callback"),
                 }
             context.user_data["rename_return"] = rename_return
-
             await query.edit_message_text("✏️ Send new file name")
             await query.answer()
             return
 
-        await query.answer()
+        await query.answer("Unknown action", show_alert=True)
     except HttpError as e:
         logger.error(f"Files callback failed (Drive API): {e}")
         await query.answer("❌ Drive API error", show_alert=True)
@@ -999,7 +975,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     size_mb = round(file_size / (1024 * 1024), 2) if file_size else "?"
     local_path = f"/tmp/{filename}"
-    task_id = f"{file_id}_{uuid.uuid4().hex[:8]}"
+    task_id = uuid.uuid4().hex[:16]
     cancel_flags = context.bot_data.setdefault("cancel_tasks", {})
     cancel_flags[task_id] = False
     cancel_keyboard = InlineKeyboardMarkup([
@@ -1147,7 +1123,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         http = drive.auth.Get_Http_Object()
         service = build("drive", "v3", http=http, cache_discovery=False)
-        upload_keyboard = await build_upload_action_keyboard(service, uploaded_file_id)
+        upload_keyboard = await build_upload_action_keyboard(context, service, uploaded_file_id)
 
         await progress_msg.edit_text("✅ Uploaded!", reply_markup=upload_keyboard)
         logger.info(f"Uploaded: {filename} ({size_mb} MB)")
@@ -1186,7 +1162,7 @@ def main():
     app.add_handler(CommandHandler("files", files))
     app.add_handler(CommandHandler("search", search))
     app.add_handler(CallbackQueryHandler(cancel_transfer_callback, pattern=r"^cancel_"))
-    app.add_handler(CallbackQueryHandler(files_callback_handler, pattern=r"^(page_|file_|delpage_|delete_|back_|rename_|public_|private_|search:|sfile:|sback:|sdel:)"))
+    app.add_handler(CallbackQueryHandler(files_callback_handler, pattern=r"^cb_"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_rename_input))
     app.add_handler(MessageHandler(
         filters.Document.ALL | filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE,
