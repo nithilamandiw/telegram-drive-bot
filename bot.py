@@ -217,6 +217,50 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def storage(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    user = update.effective_user
+
+    if not user or user.id != OWNER_ID:
+        await message.reply_text("❌ Unauthorized access")
+        return
+
+    try:
+        drive = context.bot_data.get("drive")
+        http = drive.auth.Get_Http_Object()
+        service = build("drive", "v3", http=http, cache_discovery=False)
+        about = await asyncio.to_thread(
+            service.about().get(fields="storageQuota").execute
+        )
+        quota = about.get("storageQuota", {})
+
+        total = int(quota.get("limit", 0))
+        used = int(quota.get("usage", 0))
+        free = max(total - used, 0) if total else 0
+
+        to_gb = lambda b: b / (1024 ** 3)
+
+        if total > 0:
+            text = (
+                "💾 *Google Drive Storage*\n\n"
+                f"Total: `{to_gb(total):.2f} GB`\n"
+                f"Used: `{to_gb(used):.2f} GB`\n"
+                f"Free: `{to_gb(free):.2f} GB`"
+            )
+        else:
+            text = (
+                "💾 *Google Drive Storage*\n\n"
+                "Total: `Unlimited`\n"
+                f"Used: `{to_gb(used):.2f} GB`\n"
+                "Free: `Unlimited`"
+            )
+
+        await message.reply_text(text, parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"Storage command failed: {e}")
+        await message.reply_text(f"❌ Could not fetch storage info:\n`{str(e)}`", parse_mode="Markdown")
+
+
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     drive = context.bot_data.get("drive")
@@ -405,6 +449,7 @@ def main():
     app.bot_data["upload_semaphore"] = asyncio.Semaphore(MAX_PARALLEL_UPLOADS)
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("storage", storage))
     app.add_handler(MessageHandler(
         filters.Document.ALL | filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE,
         handle_file
