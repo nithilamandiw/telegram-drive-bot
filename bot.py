@@ -52,6 +52,10 @@ def format_size(size_bytes) -> str:
     return f"{size:.1f} {units[unit_idx]}"
 
 
+def clean_drive_file_url(file_id: str) -> str:
+    return f"https://drive.google.com/file/d/{file_id}/view"
+
+
 def fix_volume_permissions():
     try:
         subprocess.run(
@@ -119,7 +123,7 @@ async def upload_to_drive(
         ).execute
     )
 
-    return response.get("webViewLink") or f"https://drive.google.com/file/d/{response['id']}/view?usp=drivesdk"
+    return clean_drive_file_url(response["id"])
 
 
 async def download_via_local_api(
@@ -354,20 +358,21 @@ async def file_view(update: Update, context: ContextTypes.DEFAULT_TYPE, file_id:
     details = await asyncio.to_thread(
         service.files().get(
             fileId=file_id,
-            fields="id,name,size,webViewLink"
+            fields="id,name,size"
         ).execute
     )
 
     name = details.get("name", "Unnamed file")
     size_text = format_size(details.get("size"))
-    link = details.get("webViewLink", "No link available")
+    clean_link = clean_drive_file_url(details["id"])
 
     text = (
         f"📄 {name}\n"
         f"📦 {size_text}\n"
-        f"🔗 {link}"
+        "🔗 Open using the button below"
     )
     keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔗 Open File", url=clean_link)],
         [InlineKeyboardButton("🗑 Delete", callback_data=f"delete_{file_id}_{page}")],
         [InlineKeyboardButton("🔙 Back", callback_data=f"back_{page}")]
     ])
@@ -590,9 +595,10 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 progress_callback=update_upload_progress
             )
         await progress_msg.edit_text(
-            f"✅ *Uploaded!*\n"
-            f"🔗 [View on Google Drive]({link})",
-            parse_mode="Markdown"
+            "✅ Uploaded!",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔗 Open File", url=link)]
+            ])
         )
         logger.info(f"Uploaded: {filename} ({size_mb} MB)")
     except Exception as e:
