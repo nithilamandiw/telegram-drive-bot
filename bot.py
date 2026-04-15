@@ -54,9 +54,9 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await message.reply_text(f"⬇️ Downloading: {file_name}")
 
-    # 🔥 STEP 1: RAW API (ALWAYS WORKS)
+    # STEP 1: Get file path from local API
     response = requests.post(
-        f"http://localhost:8081/bot{TELEGRAM_TOKEN}/getFile",
+        f"http://127.0.0.1:8081/bot{TELEGRAM_TOKEN}/getFile",
         json={"file_id": file_id}
     ).json()
 
@@ -66,42 +66,50 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     file_path = response["result"]["file_path"]
 
-    # 🔥 STEP 2: Build download URL
-    download_url = f"http://localhost:8081/file/bot{TELEGRAM_TOKEN}/{file_path}"
+    # STEP 2: Try LOCAL download first
+    download_url = f"http://127.0.0.1:8081/file/bot{TELEGRAM_TOKEN}/{file_path}"
 
-    # 🔥 STEP 3: Download with progress
-    downloaded = 0
     progress_msg = await message.reply_text("Starting download...")
+    downloaded = 0
 
-    with requests.get(download_url, stream=True) as r:
+    r = requests.get(download_url, stream=True)
+
+    # 🔥 FALLBACK IF LOCAL FAILS
+    if r.status_code != 200:
+        print("⚠️ Local download failed, using Telegram CDN")
+
+        download_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}"
+        r = requests.get(download_url, stream=True)
+
         if r.status_code != 200:
-            await message.reply_text("❌ Download failed")
+            await message.reply_text("❌ Download failed completely")
             return
 
-        with open(local_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1024 * 1024):
-                if chunk:
-                    f.write(chunk)
-                    downloaded += len(chunk)
+    # STEP 3: Download file
+    with open(local_path, "wb") as f:
+        for chunk in r.iter_content(chunk_size=1024 * 1024):
+            if chunk:
+                f.write(chunk)
+                downloaded += len(chunk)
 
-                    percent = int(downloaded * 100 / file_size)
-                    mb_done = downloaded / (1024 * 1024)
-                    mb_total = file_size / (1024 * 1024)
+                percent = int(downloaded * 100 / file_size)
+                mb_done = downloaded / (1024 * 1024)
+                mb_total = file_size / (1024 * 1024)
 
-                    bar = progress_bar(percent)
+                bar = progress_bar(percent)
 
-                    try:
-                        await progress_msg.edit_text(
-                            f"⬇️ Downloading...\n"
-                            f"{bar} {percent}%\n"
-                            f"{mb_done:.2f}/{mb_total:.2f} MB"
-                        )
-                    except:
-                        pass
+                try:
+                    await progress_msg.edit_text(
+                        f"⬇️ Downloading...\n"
+                        f"{bar} {percent}%\n"
+                        f"{mb_done:.2f}/{mb_total:.2f} MB"
+                    )
+                except:
+                    pass
 
     await progress_msg.edit_text("☁️ Uploading to Google Drive...")
 
-    # 🔥 STEP 4: Upload to Drive
+    # STEP 4: Upload to Drive
     try:
         gfile = drive.CreateFile({
             "title": file_name,
@@ -125,7 +133,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ───── RUN BOT ─────
 app = ApplicationBuilder() \
     .token(TELEGRAM_TOKEN) \
-    .base_url("http://localhost:8081/bot") \
+    .base_url("http://127.0.0.1:8081/bot") \
     .build()
 
 app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
