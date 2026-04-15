@@ -8,6 +8,8 @@ import uuid
 import time
 import httpx
 import requests
+from yt_dlp import YoutubeDL
+from yt_dlp.utils import DownloadError
 from datetime import datetime
 from urllib.parse import urlparse, unquote
 from dotenv import load_dotenv
@@ -32,6 +34,7 @@ MAX_PARALLEL_UPLOADS = int(os.getenv("MAX_PARALLEL_UPLOADS", "3"))
 ANALYTICS_FILE = "analytics.json"
 URL_PATTERN = re.compile(r"(https?://\S+)", re.IGNORECASE)
 MAX_URL_DOWNLOAD_SIZE = int(os.getenv("MAX_URL_DOWNLOAD_SIZE", str(2 * 1024 * 1024 * 1024)))
+DOWNLOADS_DIR = "./downloads"
 
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -182,6 +185,159 @@ def filename_from_url(url: str) -> str:
 
     safe_name = decoded.replace("/", "_").replace("\\", "_")
     return safe_name or f"url_file_{uuid.uuid4().hex[:8]}.bin"
+
+
+def is_youtube_url(url: str) -> bool:
+    netloc = (urlparse(url).netloc or "").lower()
+    return "youtube.com" in netloc or "youtu.be" in netloc
+
+
+def sanitize_filename(name: str, fallback: str = "file") -> str:
+    safe = re.sub(r"[^a-zA-Z0-9._ -]", "_", (name or "")).strip().strip(".")
+    return safe[:120] if safe else fallback
+
+
+async def get_youtube_quality_options(url: str) -> dict:
+    def _extract() -> dict:
+        with YoutubeDL({"quiet": True, "skip_download": True, "noplaylist": True, "no_warnings": True}) as ydl:
+            info = ydl.extract_info(url, download=False)
+
+        formats = info.get("formats", [])
+        progressive_by_height = {}
+        for fmt in formats:
+            if fmt.get("vcodec") == "none" or fmt.get("acodec") == "none":
+                continue
+            height = fmt.get("height")
+            fmt_id = fmt.get("format_id")
+            if not height or not fmt_id:
+                continue
+
+            quality_score = int(fmt.get("tbr") or 0)
+            if height not in progressive_by_height or quality_score > progressive_by_height[height]["score"]:
+                progressive_by_height[height] = {
+                    "format_id": str(fmt_id),
+                    "height": int(height),
+                    "filesize": int(fmt.get("filesize") or fmt.get("filesize_approx") or 0),
+                    "score": quality_score,
+                }
+
+        choices = {}
+        for h in sorted(progressive_by_height.keys(), reverse=True):
+            entry = progressive_by_height[h]
+            key = f"v{h}"
+            choices[key] = {
+                "kind": "video",
+                "label": f"{h}p",
+                "format_selector": entry["format_id"],
+                "height": h,
+                "estimated_size": entry["filesize"],
+                "ext": "mp4",
+            }
+
+        choices["audio"] = {
+            "kind": "audio",
+            "label": "Audio",
+            "format_selector": "bestaudio[ext=m4a]/bestaudio/best",
+            "height": 0,
+            "estimated_size": 0,
+            "ext": "m4a",
+        }
+
+        return {
+            "title": info.get("title") or "youtube_video",
+            "choices": choices,
+        }
+
+    return await asyncio.to_thread(_extract)
+
+
+async def download_youtube_with_ytdlp(
+    url: str,
+    format_selector: str,
+    local_path: str,
+    file_size: int = 0,
+    progress_callback=None,
+    should_cancel=None,
+    task_state=None,
+) -> bool:
+    loop = asyncio.get_running_loop()
+    queue = asyncio.Queue()
+
+    def emit(event: str, *payload):
+        loop.call_soon_threadsafe(queue.put_nowait, (event, *payload))
+
+    def _download():
+        def progress_hook(d):
+            if should_cancel and should_cancel():
+                raise TransferCancelled("Download cancelled by user")
+
+            while task_state and task_state.get("paused"):
+                if should_cancel and should_cancel():
+                    raise TransferCancelled("Download cancelled by user")
+                time.sleep(0.25)
+
+            if d.get("status") == "downloading":
+                downloaded = int(d.get("downloaded_bytes") or 0)
+                total = int(d.get("total_bytes") or d.get("total_bytes_estimate") or file_size or 0)
+                if MAX_URL_DOWNLOAD_SIZE > 0 and downloaded > MAX_URL_DOWNLOAD_SIZE:
+                    raise RuntimeError(
+                        f"File exceeds max allowed size ({format_bytes_stats(MAX_URL_DOWNLOAD_SIZE)}). "
+                        f"Downloaded: {format_bytes_stats(downloaded)}"
+                    )
+                if task_state is not None:
+                    task_state["downloaded"] = downloaded
+                emit("progress", downloaded, total)
+            elif d.get("status") == "finished":
+                downloaded = int(d.get("downloaded_bytes") or 0)
+                if task_state is not None:
+                    task_state["downloaded"] = downloaded
+                emit("finished", downloaded)
+
+        opts = {
+            "quiet": True,
+            "noplaylist": True,
+            "no_warnings": True,
+            "format": format_selector,
+            "outtmpl": local_path,
+            "progress_hooks": [progress_hook],
+            "retries": 3,
+            "socket_timeout": 30,
+            "concurrent_fragment_downloads": 1,
+        }
+        with YoutubeDL(opts) as ydl:
+            ydl.download([url])
+
+    def worker():
+        try:
+            _download()
+            emit("done")
+        except TransferCancelled:
+            emit("cancel")
+        except DownloadError as e:
+            emit("error", str(e))
+        except Exception as e:
+            emit("error", str(e))
+
+    worker_task = asyncio.create_task(asyncio.to_thread(worker))
+    try:
+        while True:
+            event, *payload = await queue.get()
+            if event == "progress":
+                if progress_callback:
+                    await progress_callback(int(payload[0]), int(payload[1]))
+                continue
+            if event == "finished":
+                if progress_callback and file_size:
+                    await progress_callback(file_size, file_size)
+                continue
+            if event == "cancel":
+                raise TransferCancelled("Download cancelled by user")
+            if event == "error":
+                raise RuntimeError(payload[0])
+            if event == "done":
+                return True
+    finally:
+        await worker_task
 
 
 async def get_url_content_length(url: str) -> int:
@@ -1160,6 +1316,58 @@ async def files_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
 
         action = payload.get("action")
 
+        if action == "yt_download":
+            task_id = str(payload.get("task_id", ""))
+            choice_key = str(payload.get("choice", ""))
+            yt_tasks = context.bot_data.setdefault("yt_tasks", {})
+            task = yt_tasks.get(task_id)
+            if not task:
+                await query.answer("YouTube task expired. Send URL again.", show_alert=True)
+                return
+
+            choice = task.get("choices", {}).get(choice_key)
+            if not choice:
+                await query.answer("Quality option expired.", show_alert=True)
+                return
+
+            base_name = sanitize_filename(task.get("title") or "youtube_video", fallback="youtube_video")
+            suffix = choice.get("label", "video").replace(" ", "_").lower()
+            ext = choice.get("ext", "mp4")
+            filename = f"{base_name}_{suffix}.{ext}"
+            selected_size = int(choice.get("estimated_size") or 0)
+            selected_url = task.get("url", "")
+            selected_format = choice.get("format_selector", "best")
+
+            if selected_size and MAX_URL_DOWNLOAD_SIZE > 0 and selected_size > MAX_URL_DOWNLOAD_SIZE:
+                await query.answer("Selected quality exceeds max size limit", show_alert=True)
+                return
+
+            await query.answer(f"Downloading {choice.get('label', 'selected')}...")
+            if query.message:
+                await query.edit_message_text(f"⏬ YouTube: {choice.get('label', 'selected')} selected")
+
+            async def yt_download_runner(local_path, known_size, progress_callback, should_cancel, task_state):
+                return await download_youtube_with_ytdlp(
+                    url=selected_url,
+                    format_selector=selected_format,
+                    local_path=local_path,
+                    file_size=known_size,
+                    progress_callback=progress_callback,
+                    should_cancel=should_cancel,
+                    task_state=task_state,
+                )
+
+            await run_transfer_pipeline(
+                update,
+                context,
+                filename=filename,
+                file_size=selected_size,
+                emoji="▶️",
+                download_runner=yt_download_runner,
+                download_dir=DOWNLOADS_DIR,
+            )
+            return
+
         if action == "files_page":
             page = int(payload.get("page", 1))
             text, keyboard = await build_files_page(context, page=page, page_size=10)
@@ -1475,14 +1683,19 @@ async def run_transfer_pipeline(
     file_size: int,
     emoji: str,
     download_runner,
+    download_dir: str = "/tmp",
 ):
-    message = update.message
+    message = update.message if update.message else (update.callback_query.message if update.callback_query else None)
+    if not message:
+        return
+
     drive = context.bot_data.get("drive")
     upload_semaphore = context.bot_data.get("upload_semaphore")
 
     known_size = int(file_size or 0)
     size_label = f"{known_size / (1024 * 1024):.2f} MB" if known_size else "Unknown"
-    local_path = f"/tmp/{filename}"
+    os.makedirs(download_dir, exist_ok=True)
+    local_path = os.path.join(download_dir, filename)
     task_id = uuid.uuid4().hex[:16]
 
     transfer_tasks = context.bot_data.setdefault("transfer_tasks", {})
@@ -1726,6 +1939,9 @@ async def handle_url_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not url:
         return
 
+    if is_youtube_url(url):
+        return
+
     if not user or user.id != OWNER_ID:
         await message.reply_text("❌ Unauthorized access")
         return
@@ -1770,7 +1986,82 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get("rename_file_id"):
         await handle_rename_input(update, context)
         return
+
+    if await handle_youtube_message(update, context):
+        return
+
     await handle_url_message(update, context)
+
+
+async def handle_youtube_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    message = update.message
+    user = update.effective_user
+
+    text = (message.text or "").strip()
+    url = extract_first_url(text)
+    if not url or not is_youtube_url(url):
+        return False
+
+    if not user or user.id != OWNER_ID:
+        await message.reply_text("❌ Unauthorized access")
+        return True
+
+    status_msg = await message.reply_text("🎬 Fetching available YouTube qualities...")
+    try:
+        yt_info = await get_youtube_quality_options(url)
+    except Exception as e:
+        logger.error(f"YouTube format extraction failed: {e}")
+        await status_msg.edit_text("❌ Could not fetch formats. Video may be private/unavailable.")
+        return True
+
+    choices = yt_info.get("choices", {})
+    title = yt_info.get("title") or "youtube_video"
+    video_choices = [v for v in choices.values() if v.get("kind") == "video"]
+    if not video_choices:
+        await status_msg.edit_text("❌ No downloadable progressive formats found.")
+        return True
+
+    task_id = uuid.uuid4().hex[:10]
+    context.bot_data.setdefault("yt_tasks", {})[task_id] = {
+        "url": url,
+        "title": title,
+        "choices": choices,
+    }
+
+    keyboard_rows = []
+    ordered_video_keys = sorted(
+        [k for k, v in choices.items() if v.get("kind") == "video"],
+        key=lambda k: int(choices[k].get("height") or 0),
+        reverse=True,
+    )[:5]
+
+    row = []
+    for key in ordered_video_keys:
+        row.append(
+            InlineKeyboardButton(
+                choices[key].get("label", key),
+                callback_data=make_callback_data(context, "yt_download", task_id=task_id, choice=key)
+            )
+        )
+        if len(row) == 3:
+            keyboard_rows.append(row)
+            row = []
+    if row:
+        keyboard_rows.append(row)
+
+    if "audio" in choices:
+        keyboard_rows.append([
+            InlineKeyboardButton(
+                "Audio",
+                callback_data=make_callback_data(context, "yt_download", task_id=task_id, choice="audio")
+            )
+        ])
+
+    await status_msg.edit_text(
+        f"🎬 {title}\nSelect quality:",
+        reply_markup=InlineKeyboardMarkup(keyboard_rows)
+    )
+    return True
 
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
