@@ -14,7 +14,7 @@ DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID", "root")
 # Local Bot API server URL (running via Docker)
 LOCAL_API_URL = "http://localhost:8081/bot"
 LOCAL_API_DIR = "/var/lib/telegram-bot-api"  # path inside container
-VOLUME_HOST_PATH = "/var/lib/docker/volumes/telegram-data/_data"  # path on host
+VOLUME_HOST_PATH = "/home/azureuser/telegram-api-data"
 
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
