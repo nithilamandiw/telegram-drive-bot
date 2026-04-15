@@ -6,8 +6,8 @@ import httpx
 from dotenv import load_dotenv
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
-from telegram import Update
-from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, CallbackQueryHandler, filters, ContextTypes
 from pydrive2.auth import GoogleAuth
 from pydrive2.drive import GoogleDrive
 
@@ -270,37 +270,78 @@ async def files(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        drive = context.bot_data.get("drive")
-        http = drive.auth.Get_Http_Object()
-        service = build("drive", "v3", http=http, cache_discovery=False)
-
-        result = await asyncio.to_thread(
-            service.files().list(
-                q=f"'{DRIVE_FOLDER_ID}' in parents and trashed = false",
-                orderBy="createdTime desc",
-                pageSize=10,
-                fields="files(id,name,webViewLink,createdTime)"
-            ).execute
-        )
-
-        items = result.get("files", [])
-        if not items:
-            await message.reply_text("📂 No files found in the configured Drive folder.")
-            return
-
-        lines = ["📂 Latest files in Drive folder:\n"]
-        for idx, item in enumerate(items, start=1):
-            name = item.get("name", "Unnamed file")
-            link = item.get("webViewLink")
-            if link:
-                lines.append(f"{idx}. {name}\n   🔗 {link}")
-            else:
-                lines.append(f"{idx}. {name}")
-
-        await message.reply_text("\n".join(lines))
+        text, keyboard = await build_files_page(context, page=1, page_size=10)
+        await message.reply_text(text, reply_markup=keyboard)
     except Exception as e:
         logger.error(f"Files command failed: {e}")
         await message.reply_text(f"❌ Could not fetch files:\n`{str(e)}`", parse_mode="Markdown")
+
+
+async def build_files_page(context: ContextTypes.DEFAULT_TYPE, page: int, page_size: int = 10):
+    drive = context.bot_data.get("drive")
+    http = drive.auth.Get_Http_Object()
+    service = build("drive", "v3", http=http, cache_discovery=False)
+
+    # Simulated paging: fetch a bounded latest set, then slice by page index.
+    result = await asyncio.to_thread(
+        service.files().list(
+            q=f"'{DRIVE_FOLDER_ID}' in parents and trashed = false",
+            orderBy="createdTime desc",
+            pageSize=150,
+            fields="files(id,name,webViewLink,createdTime)"
+        ).execute
+    )
+    all_items = result.get("files", [])
+
+    if not all_items:
+        return "📂 No files found in the configured Drive folder.", None
+
+    total_pages = max(1, (len(all_items) + page_size - 1) // page_size)
+    page = max(1, min(page, total_pages))
+    start = (page - 1) * page_size
+    end = start + page_size
+    items = all_items[start:end]
+
+    lines = [f"📂 Latest files in Drive folder\nPage {page}/{total_pages}\n"]
+    for idx, item in enumerate(items, start=start + 1):
+        name = item.get("name", "Unnamed file")
+        link = item.get("webViewLink")
+        if link:
+            lines.append(f"{idx}. {name}\n   🔗 {link}")
+        else:
+            lines.append(f"{idx}. {name}")
+
+    buttons = []
+    if page > 1:
+        buttons.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"files_page_{page - 1}"))
+    if page < total_pages:
+        buttons.append(InlineKeyboardButton("➡️ Next", callback_data=f"files_page_{page + 1}"))
+    keyboard = InlineKeyboardMarkup([buttons]) if buttons else None
+
+    return "\n".join(lines), keyboard
+
+
+async def files_pagination_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = update.effective_user
+
+    if not user or user.id != OWNER_ID:
+        await query.answer("Unauthorized", show_alert=True)
+        return
+
+    try:
+        data = query.data or ""
+        if not data.startswith("files_page_"):
+            await query.answer()
+            return
+
+        page = int(data.replace("files_page_", ""))
+        text, keyboard = await build_files_page(context, page=page, page_size=10)
+        await query.edit_message_text(text=text, reply_markup=keyboard)
+        await query.answer()
+    except Exception as e:
+        logger.error(f"Files pagination failed: {e}")
+        await query.answer("Failed to load page", show_alert=True)
 
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -493,6 +534,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("storage", storage))
     app.add_handler(CommandHandler("files", files))
+    app.add_handler(CallbackQueryHandler(files_pagination_callback, pattern=r"^files_page_\d+$"))
     app.add_handler(MessageHandler(
         filters.Document.ALL | filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE,
         handle_file
