@@ -65,6 +65,18 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await message.reply_text("❌ Invalid file path")
             return
 
+        # `get_file` may return an absolute URL; convert to relative Telegram file path.
+        prefixes = [
+            f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/",
+            f"http://127.0.0.1:8081/file/bot{TELEGRAM_TOKEN}/",
+            f"http://localhost:8081/file/bot{TELEGRAM_TOKEN}/",
+        ]
+        for prefix in prefixes:
+            if file_path.startswith(prefix):
+                file_path = file_path[len(prefix):]
+                break
+        file_path = file_path.lstrip("/")
+
         # 🔥 BIG FILE → LOCAL API
         if file_size > 20 * 1024 * 1024:
             print("🚀 Using LOCAL API")
@@ -74,11 +86,10 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             print("🌐 Using TELEGRAM CDN")
             download_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}"
 
-        import requests
-        r = requests.get(download_url, stream=True)
+        r = requests.get(download_url, stream=True, timeout=120)
 
         if r.status_code != 200:
-            await message.reply_text("❌ Download failed")
+            await message.reply_text(f"❌ Download failed ({r.status_code})")
             return
 
         downloaded = 0
