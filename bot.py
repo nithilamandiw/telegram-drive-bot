@@ -1,10 +1,12 @@
 import os
+import json
 import logging
 import subprocess
 import asyncio
 import uuid
 import time
 import httpx
+from datetime import datetime
 from dotenv import load_dotenv
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -24,6 +26,7 @@ LOCAL_API_URL = "http://localhost:8081/bot"
 LOCAL_API_DIR = "/var/lib/telegram-bot-api"  # path inside container
 VOLUME_HOST_PATH = "/home/azureuser/telegram-api-data"
 MAX_PARALLEL_UPLOADS = int(os.getenv("MAX_PARALLEL_UPLOADS", "3"))
+ANALYTICS_FILE = "analytics.json"
 
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -87,6 +90,74 @@ def format_bytes_stats(num_bytes) -> str:
 
     mb = value / (1024 ** 2)
     return f"{mb:.2f} MB"
+
+
+def default_analytics_data() -> dict:
+    return {
+        "total_uploads": 0,
+        "total_downloads": 0,
+        "total_size": 0,
+        "daily": {},
+        "types": {}
+    }
+
+
+def load_analytics() -> dict:
+    if not os.path.exists(ANALYTICS_FILE):
+        return default_analytics_data()
+
+    try:
+        with open(ANALYTICS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        logger.warning(f"Failed to load analytics file, using defaults: {e}")
+        return default_analytics_data()
+
+    defaults = default_analytics_data()
+    if not isinstance(data, dict):
+        return defaults
+
+    merged = {
+        "total_uploads": int(data.get("total_uploads", defaults["total_uploads"]) or 0),
+        "total_downloads": int(data.get("total_downloads", defaults["total_downloads"]) or 0),
+        "total_size": int(data.get("total_size", defaults["total_size"]) or 0),
+        "daily": data.get("daily", defaults["daily"]) if isinstance(data.get("daily", {}), dict) else {},
+        "types": data.get("types", defaults["types"]) if isinstance(data.get("types", {}), dict) else {},
+    }
+    return merged
+
+
+def save_analytics(data: dict):
+    tmp_file = f"{ANALYTICS_FILE}.tmp"
+    with open(tmp_file, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp_file, ANALYTICS_FILE)
+
+
+def update_upload_analytics(filename: str, file_size: int):
+    data = load_analytics()
+    size = int(file_size or 0)
+
+    data["total_uploads"] = int(data.get("total_uploads", 0)) + 1
+    data["total_size"] = int(data.get("total_size", 0)) + size
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    daily = data.setdefault("daily", {})
+    today_stats = daily.setdefault(today, {"uploads": 0, "size": 0})
+    today_stats["uploads"] = int(today_stats.get("uploads", 0)) + 1
+    today_stats["size"] = int(today_stats.get("size", 0)) + size
+
+    ext = os.path.splitext((filename or "").lower())[1].lstrip(".") or "no_ext"
+    types = data.setdefault("types", {})
+    types[ext] = int(types.get(ext, 0)) + 1
+
+    save_analytics(data)
+
+
+def update_download_analytics():
+    data = load_analytics()
+    data["total_downloads"] = int(data.get("total_downloads", 0)) + 1
+    save_analytics(data)
 
 
 def get_category(filename: str) -> str:
@@ -568,6 +639,37 @@ async def stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Stats command failed: {e}")
         await message.reply_text(f"❌ Could not fetch stats:\n`{str(e)}`", parse_mode="Markdown")
+
+
+async def analytics_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    user = update.effective_user
+
+    if not user or user.id != OWNER_ID:
+        await message.reply_text("❌ Unauthorized access")
+        return
+
+    data = load_analytics()
+    today_key = datetime.now().strftime("%Y-%m-%d")
+    today_data = data.get("daily", {}).get(today_key, {"uploads": 0, "size": 0})
+
+    types = data.get("types", {})
+    top_types = sorted(types.items(), key=lambda x: x[1], reverse=True)[:5]
+    types_text = "\n".join([f"{ext}: {count}" for ext, count in top_types]) if top_types else "No uploads yet"
+
+    text = (
+        "📊 Usage Stats\n\n"
+        f"Uploads: {int(data.get('total_uploads', 0))}\n"
+        f"Downloads: {int(data.get('total_downloads', 0))}\n"
+        f"Total uploaded: {format_bytes_stats(int(data.get('total_size', 0)))}\n\n"
+        "📅 Today:\n"
+        f"Uploads: {int(today_data.get('uploads', 0))}\n"
+        f"Size: {format_bytes_stats(int(today_data.get('size', 0)))}\n\n"
+        "📁 Top file types:\n"
+        f"{types_text}"
+    )
+
+    await message.reply_text(text)
 
 
 async def files(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1465,6 +1567,11 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.bot_data.get("transfer_tasks", {}).pop(task_id, None)
         return
 
+    try:
+        update_download_analytics()
+    except Exception as e:
+        logger.warning(f"Failed to update download analytics: {e}")
+
     # Upload to Google Drive
     if task_id in context.bot_data.get("transfer_tasks", {}):
         context.bot_data["transfer_tasks"][task_id]["stage"] = "upload"
@@ -1504,6 +1611,10 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         upload_keyboard = await build_upload_action_keyboard(context, service, uploaded_file_id)
 
         await progress_msg.edit_text("✅ Uploaded!", reply_markup=upload_keyboard)
+        try:
+            update_upload_analytics(filename, file_size or 0)
+        except Exception as e:
+            logger.warning(f"Failed to update upload analytics: {e}")
         logger.info(f"Uploaded: {filename} ({size_mb} MB)")
     except TransferCancelled:
         cleanup_local_file()
@@ -1538,6 +1649,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("storage", storage))
     app.add_handler(CommandHandler("stats", stats_handler))
+    app.add_handler(CommandHandler("analytics", analytics_handler))
     app.add_handler(CommandHandler("files", files))
     app.add_handler(CommandHandler("search", search))
     app.add_handler(CallbackQueryHandler(pause_transfer_callback, pattern=r"^pause_"))
