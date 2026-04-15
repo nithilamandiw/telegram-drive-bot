@@ -261,6 +261,48 @@ async def storage(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text(f"❌ Could not fetch storage info:\n`{str(e)}`", parse_mode="Markdown")
 
 
+async def files(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    user = update.effective_user
+
+    if not user or user.id != OWNER_ID:
+        await message.reply_text("❌ Unauthorized access")
+        return
+
+    try:
+        drive = context.bot_data.get("drive")
+        http = drive.auth.Get_Http_Object()
+        service = build("drive", "v3", http=http, cache_discovery=False)
+
+        result = await asyncio.to_thread(
+            service.files().list(
+                q=f"'{DRIVE_FOLDER_ID}' in parents and trashed = false",
+                orderBy="createdTime desc",
+                pageSize=10,
+                fields="files(id,name,webViewLink,createdTime)"
+            ).execute
+        )
+
+        items = result.get("files", [])
+        if not items:
+            await message.reply_text("📂 No files found in the configured Drive folder.")
+            return
+
+        lines = ["📂 Latest files in Drive folder:\n"]
+        for idx, item in enumerate(items, start=1):
+            name = item.get("name", "Unnamed file")
+            link = item.get("webViewLink")
+            if link:
+                lines.append(f"{idx}. {name}\n   🔗 {link}")
+            else:
+                lines.append(f"{idx}. {name}")
+
+        await message.reply_text("\n".join(lines))
+    except Exception as e:
+        logger.error(f"Files command failed: {e}")
+        await message.reply_text(f"❌ Could not fetch files:\n`{str(e)}`", parse_mode="Markdown")
+
+
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     drive = context.bot_data.get("drive")
@@ -450,6 +492,7 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("storage", storage))
+    app.add_handler(CommandHandler("files", files))
     app.add_handler(MessageHandler(
         filters.Document.ALL | filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE,
         handle_file
