@@ -160,7 +160,10 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── Run bot ─────────────────────────────
 if __name__ == "__main__":
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    app = ApplicationBuilder()\
+        .token(TELEGRAM_TOKEN)\
+        .base_url("http://localhost:8081/bot")\
+        .build()
 
     app.add_handler(MessageHandler(
         filters.Document.ALL | filters.VIDEO | filters.PHOTO,
