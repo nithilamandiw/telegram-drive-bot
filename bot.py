@@ -56,39 +56,26 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     progress_msg = await message.reply_text(f"⬇️ Downloading: {file_name}")
 
     try:
-        # Choose source first: cloud for small files, local Bot API for large files.
-        use_local_api = file_size > 20 * 1024 * 1024
+        # ✅ ALWAYS use SDK to get file
+        tg_file = await context.bot.get_file(file_id)
 
-        if use_local_api:
-            print("🚀 Using LOCAL API")
-            get_file_url = (
-                f"http://127.0.0.1:8081/bot{TELEGRAM_TOKEN}/getFile?file_id={file_id}"
-            )
-        else:
-            print("🌐 Using TELEGRAM CDN")
-            get_file_url = (
-                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getFile?file_id={file_id}"
-            )
+        file_path = tg_file.file_path
 
-        # 🔥 STEP 1: GET FILE PATH
-        res = requests.get(get_file_url, timeout=60).json()
-
-        if not res.get("ok"):
-            desc = res.get("description", "unknown error")
-            await message.reply_text(f"❌ Failed to get file info: {desc}")
+        if not file_path:
+            await message.reply_text("❌ Invalid file path")
             return
 
-        file_path = res["result"]["file_path"]
-
-        # 🔥 STEP 2: CHOOSE DOWNLOAD SOURCE
-        if use_local_api:
+        # 🔥 BIG FILE → LOCAL API
+        if file_size > 20 * 1024 * 1024:
+            print("🚀 Using LOCAL API")
             download_url = f"http://127.0.0.1:8081/file/bot{TELEGRAM_TOKEN}/{file_path}"
 
         else:
+            print("🌐 Using TELEGRAM CDN")
             download_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}"
 
-        # 🔥 STEP 3: DOWNLOAD
-        r = requests.get(download_url, stream=True, timeout=120)
+        import requests
+        r = requests.get(download_url, stream=True)
 
         if r.status_code != 200:
             await message.reply_text("❌ Download failed")
@@ -121,7 +108,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await progress_msg.edit_text("☁️ Uploading to Google Drive...")
 
-    # ───── UPLOAD ─────
+    # ✅ Upload
     try:
         gfile = drive.CreateFile({
             "title": file_name,
