@@ -123,7 +123,8 @@ async def upload_to_drive(
         ).execute
     )
 
-    return clean_drive_file_url(response["id"])
+    file_id = response["id"]
+    return file_id, clean_drive_file_url(file_id)
 
 
 async def download_via_local_api(
@@ -373,7 +374,7 @@ async def file_view(update: Update, context: ContextTypes.DEFAULT_TYPE, file_id:
     )
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("🔗 Open File", url=clean_link)],
-        [InlineKeyboardButton("🗑 Delete", callback_data=f"delete_{file_id}_{page}")],
+        [InlineKeyboardButton("🗑 Delete", callback_data=f"delpage_{file_id}_{page}")],
         [InlineKeyboardButton("🔙 Back", callback_data=f"back_{page}")]
     ])
     await query.edit_message_text(text=text, reply_markup=keyboard, disable_web_page_preview=True)
@@ -412,11 +413,10 @@ async def files_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
             await query.answer()
             return
 
-        if data.startswith("delete_"):
-            payload = data[len("delete_"):]
+        if data.startswith("delpage_"):
+            payload = data[len("delpage_"):]
             file_id, page_str = payload.rsplit("_", 1)
             page = int(page_str)
-
             drive = context.bot_data.get("drive")
             http = drive.auth.Get_Http_Object()
             service = build("drive", "v3", http=http, cache_discovery=False)
@@ -424,10 +424,29 @@ async def files_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
             await asyncio.to_thread(
                 service.files().delete(fileId=file_id).execute
             )
-
             text, keyboard = await build_files_page(context, page=page, page_size=10)
             await query.edit_message_text(text=text, reply_markup=keyboard)
             await query.answer("✅ File deleted")
+            return
+
+        if data.startswith("delete_"):
+            payload = data[len("delete_"):]
+            drive = context.bot_data.get("drive")
+            http = drive.auth.Get_Http_Object()
+            service = build("drive", "v3", http=http, cache_discovery=False)
+
+            await asyncio.to_thread(
+                service.files().delete(fileId=payload).execute
+            )
+            await query.edit_message_text("✅ File deleted from Google Drive.")
+            await query.answer("✅ File deleted")
+            return
+
+        if data.startswith("rename_"):
+            file_id = data[len("rename_"):]
+            context.user_data["rename_file_id"] = file_id
+            await query.edit_message_text("✏️ Send new file name")
+            await query.answer()
             return
 
         await query.answer()
@@ -437,6 +456,41 @@ async def files_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
     except Exception as e:
         logger.error(f"Files callback failed: {e}")
         await query.answer("❌ Action failed", show_alert=True)
+
+
+async def handle_rename_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    user = update.effective_user
+
+    if not user or user.id != OWNER_ID:
+        return
+
+    file_id = context.user_data.get("rename_file_id")
+    if not file_id:
+        return
+
+    new_name = (message.text or "").strip()
+    if not new_name:
+        await message.reply_text("❌ Name cannot be empty. Send a valid file name.")
+        return
+
+    try:
+        drive = context.bot_data.get("drive")
+        http = drive.auth.Get_Http_Object()
+        service = build("drive", "v3", http=http, cache_discovery=False)
+        updated = await asyncio.to_thread(
+            service.files().update(
+                fileId=file_id,
+                body={"name": new_name},
+                fields="id,name"
+            ).execute
+        )
+        context.user_data.pop("rename_file_id", None)
+        await message.reply_text(f"✅ Renamed to: {updated.get('name', new_name)}")
+    except Exception as e:
+        logger.error(f"Rename failed: {e}")
+        context.user_data.pop("rename_file_id", None)
+        await message.reply_text(f"❌ Rename failed:\n`{str(e)}`", parse_mode="Markdown")
 
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -579,7 +633,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             async with upload_semaphore:
                 await update_upload_progress(0, file_size or 0)
-                link = await upload_to_drive(
+                uploaded_file_id, link = await upload_to_drive(
                     drive,
                     local_path,
                     filename,
@@ -587,7 +641,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     progress_callback=update_upload_progress
                 )
         else:
-            link = await upload_to_drive(
+            uploaded_file_id, link = await upload_to_drive(
                 drive,
                 local_path,
                 filename,
@@ -597,7 +651,11 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await progress_msg.edit_text(
             "✅ Uploaded!",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔗 Open File", url=link)]
+                [InlineKeyboardButton("🔗 Open File", url=link)],
+                [
+                    InlineKeyboardButton("✏️ Rename", callback_data=f"rename_{uploaded_file_id}"),
+                    InlineKeyboardButton("🗑 Delete", callback_data=f"delete_{uploaded_file_id}")
+                ]
             ])
         )
         logger.info(f"Uploaded: {filename} ({size_mb} MB)")
@@ -630,7 +688,8 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("storage", storage))
     app.add_handler(CommandHandler("files", files))
-    app.add_handler(CallbackQueryHandler(files_callback_handler, pattern=r"^(page_|file_|delete_|back_)"))
+    app.add_handler(CallbackQueryHandler(files_callback_handler, pattern=r"^(page_|file_|delpage_|delete_|back_|rename_)"))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_rename_input))
     app.add_handler(MessageHandler(
         filters.Document.ALL | filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE,
         handle_file
