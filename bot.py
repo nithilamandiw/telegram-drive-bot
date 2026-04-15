@@ -3,6 +3,8 @@ import logging
 import subprocess
 import httpx
 from dotenv import load_dotenv
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
 from pydrive2.auth import GoogleAuth
@@ -46,24 +48,56 @@ def get_drive():
     return GoogleDrive(gauth)
 
 
-def upload_to_drive(drive, filepath, filename):
-    file_metadata = {
-        "title": filename,
-        "parents": [{"id": DRIVE_FOLDER_ID}]
+async def upload_to_drive(
+    drive,
+    filepath: str,
+    filename: str,
+    file_size: int,
+    progress_callback=None
+):
+    http = drive.auth.Get_Http_Object()
+    service = build("drive", "v3", http=http, cache_discovery=False)
+
+    media = MediaFileUpload(
+        filepath,
+        resumable=True,
+        chunksize=5 * 1024 * 1024
+    )
+    metadata = {
+        "name": filename,
+        "parents": [DRIVE_FOLDER_ID]
     }
-    drive_file = drive.CreateFile(file_metadata)
-    drive_file.SetContentFile(filepath)
-    drive_file.Upload()
-    drive_file.InsertPermission({
-        "type": "anyone",
-        "value": "anyone",
-        "role": "reader"
-    })
-    link = f"https://drive.google.com/file/d/{drive_file['id']}/view?usp=drivesdk"
-    return link
+
+    request = service.files().create(
+        body=metadata,
+        media_body=media,
+        fields="id,webViewLink"
+    )
+
+    response = None
+    while response is None:
+        status, response = request.next_chunk()
+        if status and progress_callback and file_size:
+            uploaded_bytes = int(status.resumable_progress)
+            await progress_callback(uploaded_bytes, file_size)
+
+    if progress_callback and file_size:
+        await progress_callback(file_size, file_size)
+
+    service.permissions().create(
+        fileId=response["id"],
+        body={"type": "anyone", "role": "reader"}
+    ).execute()
+
+    return response.get("webViewLink") or f"https://drive.google.com/file/d/{response['id']}/view?usp=drivesdk"
 
 
-async def download_via_local_api(file_id: str, local_path: str) -> bool:
+async def download_via_local_api(
+    file_id: str,
+    local_path: str,
+    file_size: int = 0,
+    progress_callback=None
+) -> bool:
     """Read file directly from the Docker volume on disk — no HTTP needed."""
     try:
         async with httpx.AsyncClient(timeout=30) as client:
@@ -89,8 +123,20 @@ async def download_via_local_api(file_id: str, local_path: str) -> bool:
             logger.warning(f"File not found on host at: {host_file_path}")
             return False
 
-        import shutil
-        shutil.copy2(host_file_path, local_path)
+        downloaded = 0
+        chunk_size = 1024 * 1024
+        with open(host_file_path, "rb") as src, open(local_path, "wb") as dst:
+            while True:
+                chunk = src.read(chunk_size)
+                if not chunk:
+                    break
+                dst.write(chunk)
+                downloaded += len(chunk)
+                if progress_callback and file_size:
+                    await progress_callback(downloaded, file_size)
+
+        if progress_callback and file_size:
+            await progress_callback(file_size, file_size)
         logger.info(f"✅ Copied from volume: {local_path}")
         return True
 
@@ -99,7 +145,12 @@ async def download_via_local_api(file_id: str, local_path: str) -> bool:
         return False
 
 
-async def download_via_cdn(file_id: str, local_path: str) -> bool:
+async def download_via_cdn(
+    file_id: str,
+    local_path: str,
+    file_size: int = 0,
+    progress_callback=None
+) -> bool:
     """Fallback: standard Telegram CDN (20MB limit only).
     We call the PUBLIC api.telegram.org here — NOT the local server —
     because the local server's file_path is an absolute filesystem path
@@ -120,6 +171,7 @@ async def download_via_cdn(file_id: str, local_path: str) -> bool:
 
         cdn_file_path = data["result"]["file_path"]
         cdn_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{cdn_file_path}"
+        downloaded = 0
 
         async with httpx.AsyncClient(timeout=120) as client:
             async with client.stream("GET", cdn_url) as response:
@@ -127,6 +179,12 @@ async def download_via_cdn(file_id: str, local_path: str) -> bool:
                 with open(local_path, "wb") as f:
                     async for chunk in response.aiter_bytes(chunk_size=1024 * 1024):
                         f.write(chunk)
+                        downloaded += len(chunk)
+                        if progress_callback and file_size:
+                            await progress_callback(downloaded, file_size)
+
+        if progress_callback and file_size:
+            await progress_callback(file_size, file_size)
 
         logger.info(f"✅ Downloaded via CDN: {local_path}")
         return True
@@ -184,15 +242,59 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     size_mb = round(file_size / (1024 * 1024), 2) if file_size else "?"
     local_path = f"/tmp/{filename}"
 
-    await message.reply_text(
-        f"{emoji} *{filename}*\n"
-        f"📦 `{size_mb} MB`\n\n"
-        f"⬇️ Downloading...",
-        parse_mode="Markdown"
+    progress_msg = await message.reply_text(
+        f"{emoji} {filename}\n"
+        f"📦 {size_mb} MB\n\n"
+        f"⬇️ Downloading... 0%"
     )
 
+    progress_state = {"download": -1, "upload": -1}
+
+    async def update_download_progress(done: int, total: int):
+        if not total:
+            return
+        percent = min(100, int(done * 100 / total))
+        if percent == progress_state["download"] or (percent < 100 and percent - progress_state["download"] < 2):
+            return
+        progress_state["download"] = percent
+        done_mb = done / (1024 * 1024)
+        total_mb = total / (1024 * 1024)
+        try:
+            await progress_msg.edit_text(
+                f"{emoji} {filename}\n"
+                f"📦 {size_mb} MB\n\n"
+                f"⬇️ Downloading... {percent}%\n"
+                f"{done_mb:.2f}/{total_mb:.2f} MB"
+            )
+        except Exception:
+            pass
+
+    async def update_upload_progress(done: int, total: int):
+        if not total:
+            return
+        percent = min(100, int(done * 100 / total))
+        if percent == progress_state["upload"] or (percent < 100 and percent - progress_state["upload"] < 2):
+            return
+        progress_state["upload"] = percent
+        done_mb = done / (1024 * 1024)
+        total_mb = total / (1024 * 1024)
+        try:
+            await progress_msg.edit_text(
+                f"{emoji} {filename}\n"
+                f"📦 {size_mb} MB\n\n"
+                f"☁️ Uploading to Google Drive... {percent}%\n"
+                f"{done_mb:.2f}/{total_mb:.2f} MB"
+            )
+        except Exception:
+            pass
+
     # Try local API first (supports up to 2GB)
-    downloaded = await download_via_local_api(file_id, local_path)
+    downloaded = await download_via_local_api(
+        file_id,
+        local_path,
+        file_size=file_size or 0,
+        progress_callback=update_download_progress
+    )
 
     # Fallback to CDN only for files under 20MB
     if not downloaded:
@@ -208,17 +310,28 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         logger.info("Falling back to Telegram CDN (file is under 20MB)...")
-        downloaded = await download_via_cdn(file_id, local_path)
+        downloaded = await download_via_cdn(
+            file_id,
+            local_path,
+            file_size=file_size or 0,
+            progress_callback=update_download_progress
+        )
 
     if not downloaded:
         await message.reply_text("❌ Could not download the file. Please try again.")
         return
 
     # Upload to Google Drive
-    status_msg = await message.reply_text("☁️ Uploading to Google Drive...")
+    await update_upload_progress(0, file_size or 0)
     try:
-        link = upload_to_drive(drive, local_path, filename)
-        await status_msg.edit_text(
+        link = await upload_to_drive(
+            drive,
+            local_path,
+            filename,
+            file_size=file_size or 0,
+            progress_callback=update_upload_progress
+        )
+        await progress_msg.edit_text(
             f"✅ *Uploaded!*\n"
             f"🔗 [View on Google Drive]({link})",
             parse_mode="Markdown"
@@ -226,7 +339,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.info(f"Uploaded: {filename} ({size_mb} MB)")
     except Exception as e:
         logger.error(f"Drive upload failed: {e}")
-        await status_msg.edit_text(f"❌ Google Drive upload failed:\n`{str(e)}`", parse_mode="Markdown")
+        await progress_msg.edit_text(f"❌ Google Drive upload failed:\n`{str(e)}`", parse_mode="Markdown")
     finally:
         if os.path.exists(local_path):
             os.remove(local_path)
