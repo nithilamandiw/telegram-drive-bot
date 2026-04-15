@@ -32,7 +32,6 @@ def get_drive():
 
 drive = get_drive()
 
-# ───── HANDLE FILE ─────
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
 
@@ -40,26 +39,46 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("Send a file.")
         return
 
-    file_id = message.document.file_id
-    file_name = message.document.file_name
+    file = message.document
+    file_id = file.file_id
+    file_name = file.file_name
 
     local_path = f"./{file_name}"
 
     progress_msg = await message.reply_text(f"⬇️ Downloading: {file_name}")
 
     try:
-        # ✅ SAFE DOWNLOAD (NO requests)
         tg_file = await context.bot.get_file(file_id)
 
-        await tg_file.download_to_drive(local_path)
+        try:
+            # 🔥 TRY LOCAL API FIRST
+            await tg_file.download_to_drive(local_path)
+
+        except Exception:
+            print("⚠️ Local failed → switching to CDN")
+
+            # 🔥 FORCE TELEGRAM CDN DOWNLOAD
+            download_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{tg_file.file_path}"
+
+            import requests
+            r = requests.get(download_url, stream=True)
+
+            if r.status_code != 200:
+                await message.reply_text("❌ Download failed completely")
+                return
+
+            with open(local_path, "wb") as f:
+                for chunk in r.iter_content(1024 * 1024):
+                    if chunk:
+                        f.write(chunk)
 
     except Exception as e:
-        await message.reply_text(f"❌ Download failed: {str(e)}")
+        await message.reply_text(f"❌ Download error: {str(e)}")
         return
 
     await progress_msg.edit_text("☁️ Uploading to Google Drive...")
 
-    # ───── UPLOAD ─────
+    # ✅ Upload to Drive
     try:
         gfile = drive.CreateFile({
             "title": file_name,
