@@ -7,12 +7,12 @@ from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTyp
 from pydrive2.auth import GoogleAuth
 from pydrive2.drive import GoogleDrive
 
-# ───────── ENV ─────────
+# ───── ENV ─────
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")
 
-# ───────── GOOGLE DRIVE ─────────
+# ───── GOOGLE DRIVE ─────
 def get_drive():
     gauth = GoogleAuth(settings_file="settings.yaml")
 
@@ -33,12 +33,12 @@ def get_drive():
 
 drive = get_drive()
 
-# ───────── PROGRESS BAR ─────────
+# ───── PROGRESS BAR ─────
 def progress_bar(percent):
     filled = percent // 10
     return "█" * filled + "░" * (10 - filled)
 
-# ───────── HANDLE FILE ─────────
+# ───── HANDLE FILE ─────
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
 
@@ -54,7 +54,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await message.reply_text(f"⬇️ Downloading: {file_name}")
 
-    # 🔥 STEP 1: ALWAYS use RAW API (NO LIMIT)
+    # 🔥 STEP 1: RAW API (ALWAYS WORKS)
     response = requests.post(
         f"http://localhost:8081/bot{TELEGRAM_TOKEN}/getFile",
         json={"file_id": file_id}
@@ -66,7 +66,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     file_path = response["result"]["file_path"]
 
-    # 🔥 STEP 2: Build correct download URL
+    # 🔥 STEP 2: Build download URL
     download_url = f"http://localhost:8081/file/bot{TELEGRAM_TOKEN}/{file_path}"
 
     # 🔥 STEP 3: Download with progress
@@ -79,7 +79,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         with open(local_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1024 * 1024):  # 1MB
+            for chunk in r.iter_content(chunk_size=1024 * 1024):
                 if chunk:
                     f.write(chunk)
                     downloaded += len(chunk)
@@ -122,7 +122,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if os.path.exists(local_path):
             os.remove(local_path)
 
-# ───────── RUN BOT ─────────
+# ───── RUN BOT ─────
 app = ApplicationBuilder() \
     .token(TELEGRAM_TOKEN) \
     .base_url("http://localhost:8081/bot") \
