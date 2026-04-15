@@ -56,12 +56,19 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     progress_msg = await message.reply_text(f"⬇️ Downloading: {file_name}")
 
     try:
-        tg_file = await context.bot.get_file(file_id)
-        file_path = tg_file.file_path
+        # 🔥 STEP 1: GET FILE PATH FROM OFFICIAL TELEGRAM
+        import requests
+        res = requests.get(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getFile?file_id={file_id}"
+        ).json()
 
-        downloaded = 0
+        if not res.get("ok"):
+            await message.reply_text("❌ Failed to get file info")
+            return
 
-        # 🔥 BIG FILE → USE LOCAL API
+        file_path = res["result"]["file_path"]
+
+        # 🔥 STEP 2: CHOOSE DOWNLOAD SOURCE
         if file_size > 20 * 1024 * 1024:
             print("🚀 Using LOCAL API")
 
@@ -72,11 +79,14 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             download_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}"
 
+        # 🔥 STEP 3: DOWNLOAD
         r = requests.get(download_url, stream=True)
 
         if r.status_code != 200:
             await message.reply_text("❌ Download failed")
             return
+
+        downloaded = 0
 
         with open(local_path, "wb") as f:
             for chunk in r.iter_content(1024 * 1024):
@@ -88,12 +98,10 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     mb_done = downloaded / (1024 * 1024)
                     mb_total = file_size / (1024 * 1024)
 
-                    bar = progress_bar(percent)
-
                     try:
                         await progress_msg.edit_text(
                             f"⬇️ Downloading...\n"
-                            f"{bar} {percent}%\n"
+                            f"{percent}%\n"
                             f"{mb_done:.2f}/{mb_total:.2f} MB"
                         )
                     except:
