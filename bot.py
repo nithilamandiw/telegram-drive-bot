@@ -418,10 +418,61 @@ async def file_view(update: Update, context: ContextTypes.DEFAULT_TYPE, file_id:
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("🔗 Open File", url=clean_link)],
         [toggle_button],
+        [InlineKeyboardButton("✏️ Rename", callback_data=f"rename_{file_id}")],
         [InlineKeyboardButton("🗑 Delete", callback_data=f"delpage_{file_id}_{page}")],
         [InlineKeyboardButton("🔙 Back", callback_data=f"back_{page}")]
     ])
     await query.edit_message_text(text=text, reply_markup=keyboard, disable_web_page_preview=True)
+
+
+async def refresh_file_view_message(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    message_id: int,
+    file_id: str,
+    page: int
+):
+    drive = context.bot_data.get("drive")
+    http = drive.auth.Get_Http_Object()
+    service = build("drive", "v3", http=http, cache_discovery=False)
+
+    details = await asyncio.to_thread(
+        service.files().get(
+            fileId=file_id,
+            fields="id,name,size"
+        ).execute
+    )
+
+    name = details.get("name", "Unnamed file")
+    size_text = format_size(details.get("size"))
+    clean_link = clean_drive_file_url(details["id"])
+    public_state = await is_file_public(service, file_id)
+    toggle_button = (
+        InlineKeyboardButton("🔒 Make Private", callback_data=f"private_{file_id}")
+        if public_state else
+        InlineKeyboardButton("🌐 Make Public", callback_data=f"public_{file_id}")
+    )
+
+    text = (
+        f"📄 {name}\n"
+        f"📦 {size_text}\n"
+        "🔗 Open using the button below"
+    )
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔗 Open File", url=clean_link)],
+        [toggle_button],
+        [InlineKeyboardButton("✏️ Rename", callback_data=f"rename_{file_id}")],
+        [InlineKeyboardButton("🗑 Delete", callback_data=f"delpage_{file_id}_{page}")],
+        [InlineKeyboardButton("🔙 Back", callback_data=f"back_{page}")]
+    ])
+
+    await context.bot.edit_message_text(
+        chat_id=chat_id,
+        message_id=message_id,
+        text=text,
+        reply_markup=keyboard,
+        disable_web_page_preview=True
+    )
 
 
 async def files_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -538,6 +589,29 @@ async def files_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         if data.startswith("rename_"):
             file_id = data[len("rename_"):]
             context.user_data["rename_file_id"] = file_id
+
+            # If rename is triggered from file-view UI, remember where to refresh.
+            rename_return = None
+            if query.message and query.message.reply_markup:
+                for row in query.message.reply_markup.inline_keyboard:
+                    for btn in row:
+                        cb = btn.callback_data or ""
+                        if cb.startswith("back_"):
+                            try:
+                                page = int(cb.replace("back_", ""))
+                                rename_return = {
+                                    "chat_id": query.message.chat_id,
+                                    "message_id": query.message.message_id,
+                                    "file_id": file_id,
+                                    "page": page
+                                }
+                            except Exception:
+                                pass
+                            break
+                    if rename_return:
+                        break
+            context.user_data["rename_return"] = rename_return
+
             await query.edit_message_text("✏️ Send new file name")
             await query.answer()
             return
@@ -578,11 +652,25 @@ async def handle_rename_input(update: Update, context: ContextTypes.DEFAULT_TYPE
                 fields="id,name"
             ).execute
         )
+        rename_return = context.user_data.get("rename_return")
         context.user_data.pop("rename_file_id", None)
-        await message.reply_text(f"✅ Renamed to: {updated.get('name', new_name)}")
+        context.user_data.pop("rename_return", None)
+
+        # Reuse same rename logic: if rename started from file-view, refresh that same message.
+        if rename_return:
+            await refresh_file_view_message(
+                context=context,
+                chat_id=rename_return["chat_id"],
+                message_id=rename_return["message_id"],
+                file_id=rename_return["file_id"],
+                page=rename_return["page"]
+            )
+        else:
+            await message.reply_text(f"✅ Renamed to: {updated.get('name', new_name)}")
     except Exception as e:
         logger.error(f"Rename failed: {e}")
         context.user_data.pop("rename_file_id", None)
+        context.user_data.pop("rename_return", None)
         await message.reply_text(f"❌ Rename failed:\n`{str(e)}`", parse_mode="Markdown")
 
 
