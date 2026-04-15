@@ -33,6 +33,7 @@ VOLUME_HOST_PATH = "/home/azureuser/telegram-api-data"
 MAX_PARALLEL_UPLOADS = int(os.getenv("MAX_PARALLEL_UPLOADS", "3"))
 ANALYTICS_FILE = "analytics.json"
 URL_PATTERN = re.compile(r"(https?://\S+)", re.IGNORECASE)
+DRIVE_FILE_ID_PATTERN = re.compile(r"(?:/d/|id=)([a-zA-Z0-9_-]+)")
 MAX_URL_DOWNLOAD_SIZE = int(os.getenv("MAX_URL_DOWNLOAD_SIZE", str(2 * 1024 * 1024 * 1024)))
 DOWNLOADS_DIR = "./downloads"
 YTDLP_PROXY = os.getenv("YTDLP_PROXY", "").strip()
@@ -186,6 +187,50 @@ def filename_from_url(url: str) -> str:
 
     safe_name = decoded.replace("/", "_").replace("\\", "_")
     return safe_name or f"url_file_{uuid.uuid4().hex[:8]}.bin"
+
+
+def extract_drive_file_id(url: str) -> str | None:
+    match = DRIVE_FILE_ID_PATTERN.search(url or "")
+    if not match:
+        return None
+    return match.group(1)
+
+
+def is_google_drive_link(url: str) -> bool:
+    netloc = (urlparse(url).netloc or "").lower()
+    return "drive.google.com" in netloc
+
+
+async def clone_drive_file(context: ContextTypes.DEFAULT_TYPE, source_file_id: str):
+    drive = context.bot_data.get("drive")
+    http = drive.auth.Get_Http_Object()
+    service = build("drive", "v3", http=http, cache_discovery=False)
+
+    original = await asyncio.to_thread(
+        service.files().get(fileId=source_file_id, fields="id,name").execute
+    )
+    original_name = original.get("name", "Unnamed file")
+
+    copied = await asyncio.to_thread(
+        service.files().copy(
+            fileId=source_file_id,
+            body={
+                "name": f"Copied_{original_name}",
+                "parents": [DRIVE_FOLDER_ID]
+            },
+            fields="id,name"
+        ).execute
+    )
+
+    new_id = copied.get("id")
+    if not new_id:
+        raise RuntimeError("Drive copy returned no file id")
+
+    return {
+        "id": new_id,
+        "name": copied.get("name", f"Copied_{original_name}"),
+        "link": clean_drive_file_url(new_id),
+    }
 
 
 def is_youtube_url(url: str) -> bool:
@@ -2183,9 +2228,49 @@ async def handle_url_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
 
+async def handle_drive_link_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    message = update.message
+    user = update.effective_user
+
+    text = (message.text or "").strip()
+    url = extract_first_url(text)
+    if not url or not is_google_drive_link(url):
+        return False
+
+    if not user or user.id != OWNER_ID:
+        await message.reply_text("❌ Unauthorized access")
+        return True
+
+    file_id = extract_drive_file_id(url)
+    if not file_id:
+        await message.reply_text("❌ Invalid Google Drive link")
+        return True
+
+    status_msg = await message.reply_text("📎 Cloning Google Drive file...")
+    try:
+        cloned = await clone_drive_file(context, file_id)
+        await status_msg.edit_text(
+            "✅ File cloned successfully\n"
+            f"Name: {cloned['name']}\n"
+            f"Link: {cloned['link']}",
+            disable_web_page_preview=True
+        )
+    except HttpError as e:
+        logger.error(f"Drive clone failed (API): {e}")
+        await status_msg.edit_text("❌ Could not clone file. It may be private or inaccessible.")
+    except Exception as e:
+        logger.error(f"Drive clone failed: {e}")
+        await status_msg.edit_text("❌ Failed to clone Google Drive link")
+
+    return True
+
+
 async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get("rename_file_id"):
         await handle_rename_input(update, context)
+        return
+
+    if await handle_drive_link_message(update, context):
         return
 
     if await handle_youtube_message(update, context):
