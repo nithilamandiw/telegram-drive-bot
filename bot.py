@@ -5,7 +5,6 @@ from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 from pydrive2.auth import GoogleAuth
-from pydrive2.drive import GoogleDrive
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
@@ -15,6 +14,11 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID", "root")
 
 logging.basicConfig(level=logging.INFO)
+
+# ── Progress bar ─────────────────────────
+def progress_bar(progress, length=20):
+    filled = int(length * progress // 100)
+    return "█" * filled + "░" * (length - filled)
 
 # ── Google Drive Auth ────────────────────
 def get_drive_service():
@@ -33,12 +37,11 @@ def get_drive_service():
 
     gauth.SaveCredentialsFile("saved_creds.json")
 
-    # ✅ FIX: build correct Drive API service
     return build("drive", "v3", credentials=gauth.credentials)
 
 drive_service = get_drive_service()
 
-# ── Upload with PRO progress ─────────────
+# ── Upload with PRO UI ───────────────────
 def upload_to_drive_with_progress(filepath, filename, progress_message):
     file_metadata = {
         "name": filename,
@@ -47,7 +50,7 @@ def upload_to_drive_with_progress(filepath, filename, progress_message):
 
     media = MediaFileUpload(filepath, resumable=True)
 
-    request = drive_service.files().create(   # ✅ CORRECT API
+    request = drive_service.files().create(
         body=file_metadata,
         media_body=media,
         fields="id"
@@ -55,6 +58,7 @@ def upload_to_drive_with_progress(filepath, filename, progress_message):
 
     response = None
     start_time = time.time()
+    last_update = 0
 
     while response is None:
         status, response = request.next_chunk()
@@ -74,11 +78,18 @@ def upload_to_drive_with_progress(filepath, filename, progress_message):
             remaining_mb = total_mb - uploaded_mb
             eta = remaining_mb / speed if speed > 0 else 0
 
-            progress_message.edit_text(
-                f"☁️ Uploading... {progress}%\n"
-                f"{uploaded_mb:.2f} / {total_mb:.2f} MB\n"
-                f"⚡ {speed:.2f} MB/s | ⏱ {int(eta)}s left"
-            )
+            # limit updates (1 sec)
+            if time.time() - last_update > 1:
+                last_update = time.time()
+
+                bar = progress_bar(progress)
+
+                progress_message.edit_text(
+                    f"☁️ Uploading...\n"
+                    f"{bar} {progress}%\n"
+                    f"{uploaded_mb:.2f} / {total_mb:.2f} MB\n"
+                    f"⚡ {speed:.2f} MB/s | ⏱ {int(eta)}s left"
+                )
 
     file_id = response.get("id")
     return f"https://drive.google.com/file/d/{file_id}/view"
