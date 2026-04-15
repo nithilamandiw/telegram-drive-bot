@@ -1,5 +1,6 @@
 import os
 import logging
+import subprocess
 import httpx
 from dotenv import load_dotenv
 from telegram import Update
@@ -21,6 +22,15 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+def fix_volume_permissions():
+    try:
+        subprocess.run(
+            ["sudo", "chmod", "-R", "o+rx", "/home/azureuser/telegram-api-data/"],
+            check=True, capture_output=True
+        )
+    except Exception as e:
+        logger.warning(f"Could not fix volume permissions: {e}")
 
 
 def get_drive():
@@ -222,6 +232,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
+    fix_volume_permissions()
     logger.info("Authenticating with Google Drive...")
     drive = get_drive()
     logger.info("✅ Google Drive ready")
