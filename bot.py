@@ -13,6 +13,7 @@ DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID", "root")
 
 # Local Bot API server URL (running via Docker)
 LOCAL_API_URL = "http://localhost:8081/bot"
+LOCAL_API_DIR = "/var/lib/telegram-bot-api"  # matches --dir in your Docker run command
 
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -54,7 +55,6 @@ def upload_to_drive(drive, filepath, filename):
 async def download_via_local_api(file_id: str, local_path: str) -> bool:
     """Download file using local Bot API server — supports files up to 2GB."""
     try:
-        # Step 1: Get file path from local API
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
                 f"{LOCAL_API_URL}{TELEGRAM_TOKEN}/getFile",
@@ -68,12 +68,18 @@ async def download_via_local_api(file_id: str, local_path: str) -> bool:
 
         file_path = data["result"]["file_path"]
 
-        # FIX: The local API returns an absolute path like /var/lib/telegram-bot-api/.../file.psd
-        # Stripping the leading slash prevents a double-slash in the URL (which caused 404s).
-        download_url = f"http://localhost:8081/file/bot{TELEGRAM_TOKEN}/{file_path.lstrip('/')}"
-        logger.info(f"Downloading from local API: {file_path}")
+        # The local API returns an absolute path like:
+        #   /var/lib/telegram-bot-api/1875002742:.../documents/file_3.psd
+        # The server only serves the part AFTER --dir, so strip that prefix.
+        if file_path.startswith(LOCAL_API_DIR):
+            relative_path = file_path[len(LOCAL_API_DIR):].lstrip("/")
+        else:
+            relative_path = file_path.lstrip("/")
 
-        async with httpx.AsyncClient(timeout=600) as client:  # 10 min timeout for large files
+        download_url = f"http://localhost:8081/file/bot{TELEGRAM_TOKEN}/{relative_path}"
+        logger.info(f"Downloading from local API: {download_url}")
+
+        async with httpx.AsyncClient(timeout=600) as client:
             async with client.stream("GET", download_url) as response:
                 response.raise_for_status()
                 with open(local_path, "wb") as f:
