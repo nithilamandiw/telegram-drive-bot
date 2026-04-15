@@ -1,0 +1,20 @@
+# Secrets - never commit these!
+.env
+client_secrets.json
+saved_creds.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Temp files
+/tmp/
+*.tmp
