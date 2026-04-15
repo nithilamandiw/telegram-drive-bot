@@ -211,7 +211,8 @@ async def download_via_local_api(
     local_path: str,
     file_size: int = 0,
     progress_callback=None,
-    should_cancel=None
+    should_cancel=None,
+    task_state=None
 ) -> bool:
     """Read file directly from the Docker volume on disk — no HTTP needed."""
     try:
@@ -230,6 +231,9 @@ async def download_via_local_api(
         # file_path is like: /var/lib/telegram-bot-api/1875002742:.../documents/file_3.psd
         # Remap it to the host volume path
         host_file_path = file_path.replace(LOCAL_API_DIR, VOLUME_HOST_PATH, 1)
+        if task_state is not None:
+            task_state["url"] = host_file_path
+            task_state["file_path"] = local_path
 
         logger.info(f"Reading directly from volume: {host_file_path}")
 
@@ -238,10 +242,25 @@ async def download_via_local_api(
             logger.warning(f"File not found on host at: {host_file_path}")
             return False
 
-        downloaded = 0
+        downloaded = os.path.getsize(local_path) if os.path.exists(local_path) else 0
+        if task_state is not None:
+            task_state["downloaded"] = downloaded
+
+        if file_size and downloaded >= file_size:
+            if progress_callback:
+                await progress_callback(file_size, file_size)
+            return True
+
         chunk_size = 1024 * 1024
-        with open(host_file_path, "rb") as src, open(local_path, "wb") as dst:
+        with open(host_file_path, "rb") as src, open(local_path, "ab" if downloaded > 0 else "wb") as dst:
+            if downloaded > 0:
+                src.seek(downloaded)
             while True:
+                if task_state and task_state.get("cancel"):
+                    raise TransferCancelled("Download cancelled by user")
+                if task_state and task_state.get("paused"):
+                    await asyncio.sleep(1)
+                    continue
                 chunk = src.read(chunk_size)
                 if not chunk:
                     break
@@ -249,6 +268,8 @@ async def download_via_local_api(
                     raise TransferCancelled("Download cancelled by user")
                 dst.write(chunk)
                 downloaded += len(chunk)
+                if task_state is not None:
+                    task_state["downloaded"] = downloaded
                 if progress_callback and file_size:
                     await progress_callback(downloaded, file_size)
 
@@ -269,7 +290,8 @@ async def download_via_cdn(
     local_path: str,
     file_size: int = 0,
     progress_callback=None,
-    should_cancel=None
+    should_cancel=None,
+    task_state=None
 ) -> bool:
     """Fallback: standard Telegram CDN (20MB limit only).
     We call the PUBLIC api.telegram.org here — NOT the local server —
@@ -291,17 +313,47 @@ async def download_via_cdn(
 
         cdn_file_path = data["result"]["file_path"]
         cdn_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{cdn_file_path}"
-        downloaded = 0
+
+        downloaded = os.path.getsize(local_path) if os.path.exists(local_path) else 0
+        if task_state is not None:
+            task_state["url"] = cdn_url
+            task_state["file_path"] = local_path
+            task_state["downloaded"] = downloaded
+
+        if file_size and downloaded >= file_size:
+            if progress_callback:
+                await progress_callback(file_size, file_size)
+            return True
+
+        headers = {}
+        if downloaded > 0:
+            headers["Range"] = f"bytes={downloaded}-"
 
         async with httpx.AsyncClient(timeout=120) as client:
-            async with client.stream("GET", cdn_url) as response:
+            async with client.stream("GET", cdn_url, headers=headers) as response:
+                if response.status_code == 416:
+                    if progress_callback and file_size:
+                        await progress_callback(file_size, file_size)
+                    return True
+                if downloaded > 0 and response.status_code == 200:
+                    # Server ignored range; restart from scratch safely.
+                    downloaded = 0
+                    if os.path.exists(local_path):
+                        os.remove(local_path)
                 response.raise_for_status()
-                with open(local_path, "wb") as f:
+                with open(local_path, "ab" if downloaded > 0 else "wb") as f:
                     async for chunk in response.aiter_bytes(chunk_size=1024 * 1024):
+                        if task_state and task_state.get("cancel"):
+                            raise TransferCancelled("Download cancelled by user")
+                        if task_state and task_state.get("paused"):
+                            await asyncio.sleep(1)
+                            continue
                         if should_cancel and should_cancel():
                             raise TransferCancelled("Download cancelled by user")
                         f.write(chunk)
                         downloaded += len(chunk)
+                        if task_state is not None:
+                            task_state["downloaded"] = downloaded
                         if progress_callback and file_size:
                             await progress_callback(downloaded, file_size)
 
@@ -991,12 +1043,71 @@ async def cancel_transfer_callback(update: Update, context: ContextTypes.DEFAULT
         return
 
     task_id = data[len("cancel_"):]
-    cancel_flags = context.bot_data.setdefault("cancel_tasks", {})
-    if task_id in cancel_flags:
-        cancel_flags[task_id] = True
+    transfer_tasks = context.bot_data.setdefault("transfer_tasks", {})
+    task = transfer_tasks.get(task_id)
+    if task:
+        task["cancel"] = True
         await query.answer("Cancelling...")
     else:
         await query.answer("Task not found or already finished", show_alert=True)
+
+
+async def pause_transfer_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = update.effective_user
+
+    if not user or user.id != OWNER_ID:
+        await query.answer("Unauthorized", show_alert=True)
+        return
+
+    data = query.data or ""
+    if not data.startswith("pause_"):
+        await query.answer()
+        return
+
+    task_id = data[len("pause_"):]
+    transfer_tasks = context.bot_data.setdefault("transfer_tasks", {})
+    task = transfer_tasks.get(task_id)
+    if not task:
+        await query.answer("Task not found or already finished", show_alert=True)
+        return
+
+    task["paused"] = True
+    kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("▶️ Resume", callback_data=f"resume_{task_id}"),
+            InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{task_id}")
+        ]
+    ])
+    try:
+        await query.edit_message_text("⏸ Paused", reply_markup=kb)
+    except Exception:
+        pass
+    await query.answer("Paused")
+
+
+async def resume_transfer_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = update.effective_user
+
+    if not user or user.id != OWNER_ID:
+        await query.answer("Unauthorized", show_alert=True)
+        return
+
+    data = query.data or ""
+    if not data.startswith("resume_"):
+        await query.answer()
+        return
+
+    task_id = data[len("resume_"):]
+    transfer_tasks = context.bot_data.setdefault("transfer_tasks", {})
+    task = transfer_tasks.get(task_id)
+    if not task:
+        await query.answer("Task not found or already finished", show_alert=True)
+        return
+
+    task["paused"] = False
+    await query.answer("Resumed")
 
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1044,14 +1155,38 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     size_mb = round(file_size / (1024 * 1024), 2) if file_size else "?"
     local_path = f"/tmp/{filename}"
     task_id = uuid.uuid4().hex[:16]
-    cancel_flags = context.bot_data.setdefault("cancel_tasks", {})
-    cancel_flags[task_id] = False
-    cancel_keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{task_id}")]
-    ])
+    transfer_tasks = context.bot_data.setdefault("transfer_tasks", {})
+    transfer_tasks[task_id] = {
+        "paused": False,
+        "cancel": False,
+        "downloaded": 0,
+        "file_path": local_path,
+        "url": None,
+        "stage": "download",
+    }
+
+    def transfer_keyboard():
+        task = context.bot_data.get("transfer_tasks", {}).get(task_id, {})
+        if task.get("stage") == "download":
+            if task.get("paused"):
+                return InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton("▶️ Resume", callback_data=f"resume_{task_id}"),
+                        InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{task_id}")
+                    ]
+                ])
+            return InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("⏸ Pause", callback_data=f"pause_{task_id}"),
+                    InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{task_id}")
+                ]
+            ])
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{task_id}")]
+        ])
 
     def is_cancelled() -> bool:
-        return bool(context.bot_data.get("cancel_tasks", {}).get(task_id, False))
+        return bool(context.bot_data.get("transfer_tasks", {}).get(task_id, {}).get("cancel", False))
 
     def cleanup_local_file():
         if os.path.exists(local_path):
@@ -1061,7 +1196,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"{emoji} {filename}\n"
         f"📦 {size_mb} MB\n\n"
         f"⬇️ Downloading... 0%",
-        reply_markup=cancel_keyboard
+        reply_markup=transfer_keyboard()
     )
 
     progress_state = {
@@ -1111,7 +1246,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"{done_mb:.2f}/{total_mb:.2f} MB\n\n"
                 f"🚀 Speed: {speed_text}\n"
                 f"⏱ ETA: {eta_text}",
-                reply_markup=cancel_keyboard
+                reply_markup=transfer_keyboard()
             )
         except Exception:
             pass
@@ -1154,7 +1289,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"{done_mb:.2f}/{total_mb:.2f} MB\n\n"
                 f"🚀 Speed: {speed_text}\n"
                 f"⏱ ETA: {eta_text}",
-                reply_markup=cancel_keyboard
+                reply_markup=transfer_keyboard()
             )
         except Exception:
             pass
@@ -1166,12 +1301,13 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             local_path,
             file_size=file_size or 0,
             progress_callback=update_download_progress,
-            should_cancel=is_cancelled
+            should_cancel=is_cancelled,
+            task_state=context.bot_data.get("transfer_tasks", {}).get(task_id)
         )
     except TransferCancelled:
         cleanup_local_file()
         await progress_msg.edit_text("❌ Cancelled")
-        context.bot_data.get("cancel_tasks", {}).pop(task_id, None)
+        context.bot_data.get("transfer_tasks", {}).pop(task_id, None)
         return
 
     # Fallback to CDN only for files under 20MB
@@ -1185,7 +1321,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown"
             )
             logger.error(f"Local API failed and file is too large for CDN ({size_mb} MB)")
-            context.bot_data.get("cancel_tasks", {}).pop(task_id, None)
+            context.bot_data.get("transfer_tasks", {}).pop(task_id, None)
             return
 
         logger.info("Falling back to Telegram CDN (file is under 20MB)...")
@@ -1195,20 +1331,23 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 local_path,
                 file_size=file_size or 0,
                 progress_callback=update_download_progress,
-                should_cancel=is_cancelled
+                should_cancel=is_cancelled,
+                task_state=context.bot_data.get("transfer_tasks", {}).get(task_id)
             )
         except TransferCancelled:
             cleanup_local_file()
             await progress_msg.edit_text("❌ Cancelled")
-            context.bot_data.get("cancel_tasks", {}).pop(task_id, None)
+            context.bot_data.get("transfer_tasks", {}).pop(task_id, None)
             return
 
     if not downloaded:
         await message.reply_text("❌ Could not download the file. Please try again.")
-        context.bot_data.get("cancel_tasks", {}).pop(task_id, None)
+        context.bot_data.get("transfer_tasks", {}).pop(task_id, None)
         return
 
     # Upload to Google Drive
+    if task_id in context.bot_data.get("transfer_tasks", {}):
+        context.bot_data["transfer_tasks"][task_id]["stage"] = "upload"
     await update_upload_progress(0, file_size or 0)
     try:
         if upload_semaphore:
@@ -1216,7 +1355,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"{emoji} {filename}\n"
                 f"📦 {size_mb} MB\n\n"
                 f"⏳ Waiting for upload slot...",
-                reply_markup=cancel_keyboard
+                reply_markup=transfer_keyboard()
             )
 
             async with upload_semaphore:
@@ -1253,7 +1392,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await progress_msg.edit_text(f"❌ Google Drive upload failed:\n`{str(e)}`", parse_mode="Markdown")
     finally:
         cleanup_local_file()
-        context.bot_data.get("cancel_tasks", {}).pop(task_id, None)
+        context.bot_data.get("transfer_tasks", {}).pop(task_id, None)
 
 
 def main():
@@ -1279,6 +1418,8 @@ def main():
     app.add_handler(CommandHandler("stats", stats_handler))
     app.add_handler(CommandHandler("files", files))
     app.add_handler(CommandHandler("search", search))
+    app.add_handler(CallbackQueryHandler(pause_transfer_callback, pattern=r"^pause_"))
+    app.add_handler(CallbackQueryHandler(resume_transfer_callback, pattern=r"^resume_"))
     app.add_handler(CallbackQueryHandler(cancel_transfer_callback, pattern=r"^cancel_"))
     app.add_handler(CallbackQueryHandler(files_callback_handler, pattern=r"^cb_"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_rename_input))
