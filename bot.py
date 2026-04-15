@@ -89,6 +89,21 @@ def format_bytes_stats(num_bytes) -> str:
     return f"{mb:.2f} MB"
 
 
+def get_category(filename: str) -> str:
+    ext = os.path.splitext((filename or "").lower())[1]
+    if ext in {".mp4", ".mkv", ".avi"}:
+        return "Videos"
+    if ext in {".zip", ".rar", ".7z"}:
+        return "Archives"
+    if ext in {".psd", ".ai"}:
+        return "Design"
+    if ext in {".jpg", ".jpeg", ".png"}:
+        return "Images"
+    if ext in {".pdf", ".docx"}:
+        return "Documents"
+    return "Others"
+
+
 def clean_drive_file_url(file_id: str) -> str:
     return f"https://drive.google.com/file/d/{file_id}/view"
 
@@ -108,6 +123,44 @@ async def get_public_permission_id(service, file_id: str):
         if perm.get("type") == "anyone" and perm.get("role") == "reader":
             return perm.get("id")
     return None
+
+
+async def ensure_category_folder(context: ContextTypes.DEFAULT_TYPE, service, category: str) -> str:
+    folders_cache = context.bot_data.setdefault("folders", {})
+    if category in folders_cache:
+        return folders_cache[category]
+
+    query = (
+        f"'{DRIVE_FOLDER_ID}' in parents and "
+        f"mimeType='application/vnd.google-apps.folder' and "
+        f"name='{escape_drive_query_value(category)}' and trashed=false"
+    )
+    result = await asyncio.to_thread(
+        service.files().list(
+            q=query,
+            fields="files(id,name)",
+            pageSize=1
+        ).execute
+    )
+    items = result.get("files", [])
+    if items:
+        folder_id = items[0]["id"]
+        folders_cache[category] = folder_id
+        return folder_id
+
+    created = await asyncio.to_thread(
+        service.files().create(
+            body={
+                "name": category,
+                "mimeType": "application/vnd.google-apps.folder",
+                "parents": [DRIVE_FOLDER_ID],
+            },
+            fields="id"
+        ).execute
+    )
+    folder_id = created["id"]
+    folders_cache[category] = folder_id
+    return folder_id
 
 
 async def is_file_public(service, file_id: str) -> bool:
@@ -155,6 +208,7 @@ def get_drive():
 
 
 async def upload_to_drive(
+    context: ContextTypes.DEFAULT_TYPE,
     drive,
     filepath: str,
     filename: str,
@@ -170,9 +224,11 @@ async def upload_to_drive(
         resumable=True,
         chunksize=5 * 1024 * 1024
     )
+    category = get_category(filename)
+    parent_folder_id = await ensure_category_folder(context, service, category)
     metadata = {
         "name": filename,
-        "parents": [DRIVE_FOLDER_ID]
+        "parents": [parent_folder_id]
     }
 
     request = service.files().create(
@@ -1361,6 +1417,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             async with upload_semaphore:
                 await update_upload_progress(0, file_size or 0)
                 uploaded_file_id, link = await upload_to_drive(
+                    context,
                     drive,
                     local_path,
                     filename,
@@ -1370,6 +1427,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
         else:
             uploaded_file_id, link = await upload_to_drive(
+                context,
                 drive,
                 local_path,
                 filename,
