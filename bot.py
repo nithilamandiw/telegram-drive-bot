@@ -1,89 +1,222 @@
 import os
+import logging
+import httpx
 from dotenv import load_dotenv
 from telegram import Update
-from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
-
+from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
 from pydrive2.auth import GoogleAuth
 from pydrive2.drive import GoogleDrive
 
-# ───── ENV ─────
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")
+DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID", "root")
 
-# ───── GOOGLE DRIVE ─────
+# Local Bot API server URL (running via Docker)
+LOCAL_API_URL = "http://localhost:8081/bot"
+
+logging.basicConfig(
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+
 def get_drive():
     gauth = GoogleAuth(settings_file="settings.yaml")
-
-    if os.path.exists("saved_creds.json"):
-        gauth.LoadCredentialsFile("saved_creds.json")
-
+    gauth.LoadCredentialsFile("saved_creds.json")
     if gauth.credentials is None:
-        raise Exception("❌ Missing Google credentials")
-
+        gauth.LocalWebserverAuth()
     elif gauth.access_token_expired:
         gauth.Refresh()
     else:
         gauth.Authorize()
-
     gauth.SaveCredentialsFile("saved_creds.json")
-
     return GoogleDrive(gauth)
 
-drive = get_drive()
 
-# ───── HANDLE FILE ─────
+def upload_to_drive(drive, filepath, filename):
+    file_metadata = {
+        "title": filename,
+        "parents": [{"id": DRIVE_FOLDER_ID}]
+    }
+    drive_file = drive.CreateFile(file_metadata)
+    drive_file.SetContentFile(filepath)
+    drive_file.Upload()
+    drive_file.InsertPermission({
+        "type": "anyone",
+        "value": "anyone",
+        "role": "reader"
+    })
+    link = f"https://drive.google.com/file/d/{drive_file['id']}/view?usp=drivesdk"
+    return link
+
+
+async def download_via_local_api(file_id: str, local_path: str) -> bool:
+    """Download file using local Bot API server — supports files up to 2GB."""
+    try:
+        # Step 1: Get file path from local API
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                f"{LOCAL_API_URL}{TELEGRAM_TOKEN}/getFile",
+                json={"file_id": file_id}
+            )
+            data = resp.json()
+
+        if not data.get("ok"):
+            logger.warning(f"Local API getFile failed: {data}")
+            return False
+
+        file_path = data["result"]["file_path"]
+
+        # Step 2: Download the file from local server
+        download_url = f"http://localhost:8081/file/bot{TELEGRAM_TOKEN}/{file_path}"
+        logger.info(f"Downloading from local API: {file_path}")
+
+        async with httpx.AsyncClient(timeout=600) as client:  # 10 min timeout for large files
+            async with client.stream("GET", download_url) as response:
+                response.raise_for_status()
+                with open(local_path, "wb") as f:
+                    async for chunk in response.aiter_bytes(chunk_size=1024 * 1024):
+                        f.write(chunk)
+
+        logger.info(f"✅ Downloaded via local API: {local_path}")
+        return True
+
+    except Exception as e:
+        logger.warning(f"Local API download failed: {e}")
+        return False
+
+
+async def download_via_cdn(tg_file_obj, local_path: str) -> bool:
+    """Fallback: standard Telegram CDN (20MB limit)."""
+    try:
+        await tg_file_obj.download_to_drive(local_path)
+        logger.info(f"✅ Downloaded via CDN: {local_path}")
+        return True
+    except Exception as e:
+        logger.warning(f"CDN download failed: {e}")
+        return False
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "👋 Hello! I'm your *Google Drive Upload Bot*.\n\n"
+        "Send me any file, photo, video, audio or voice message "
+        "and I'll upload it to your Google Drive! 🚀\n\n"
+        "✅ Supports files up to *2GB* via local API server.",
+        parse_mode="Markdown"
+    )
+
+
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
+    drive = context.bot_data.get("drive")
 
-    if not message.document:
-        await message.reply_text("Send a file.")
+    # Detect file type
+    if message.document:
+        file_id = message.document.file_id
+        filename = message.document.file_name or f"file_{file_id[:8]}"
+        file_size = message.document.file_size
+        emoji = "📄"
+    elif message.photo:
+        photo = message.photo[-1]
+        file_id = photo.file_id
+        filename = f"photo_{file_id[:8]}.jpg"
+        file_size = photo.file_size
+        emoji = "🖼"
+    elif message.video:
+        file_id = message.video.file_id
+        filename = message.video.file_name or f"video_{file_id[:8]}.mp4"
+        file_size = message.video.file_size
+        emoji = "🎥"
+    elif message.audio:
+        file_id = message.audio.file_id
+        filename = message.audio.file_name or f"audio_{file_id[:8]}.mp3"
+        file_size = message.audio.file_size
+        emoji = "🎵"
+    elif message.voice:
+        file_id = message.voice.file_id
+        filename = f"voice_{file_id[:8]}.ogg"
+        file_size = message.voice.file_size
+        emoji = "🎤"
+    else:
+        await message.reply_text("❓ Please send a file, photo, video, audio or voice message.")
         return
 
-    file = message.document
-    file_name = file.file_name
-    file_id = file.file_id
+    size_mb = round(file_size / (1024 * 1024), 2) if file_size else "?"
+    local_path = f"/tmp/{filename}"
 
-    local_path = f"./{file_name}"
+    await message.reply_text(
+        f"{emoji} *{filename}*\n"
+        f"📦 `{size_mb} MB`\n\n"
+        f"⬇️ Downloading...",
+        parse_mode="Markdown"
+    )
 
-    msg = await message.reply_text(f"⬇️ Downloading: {file_name}")
+    # Try local API first (supports >20MB), fallback to CDN
+    downloaded = await download_via_local_api(file_id, local_path)
 
-    try:
-        # ✅ Telegram handles everything
-        tg_file = await context.bot.get_file(file_id)
-        await tg_file.download_to_drive(local_path)
+    if not downloaded:
+        logger.info("Falling back to Telegram CDN...")
+        try:
+            tg_file = await context.bot.get_file(file_id)
+            downloaded = await download_via_cdn(tg_file, local_path)
+        except Exception as e:
+            await message.reply_text(
+                f"❌ *Download failed!*\n\n"
+                f"Make sure your local API Docker container is running:\n"
+                f"`docker ps`",
+                parse_mode="Markdown"
+            )
+            logger.error(f"All download methods failed: {e}")
+            return
 
-    except Exception as e:
-        await message.reply_text(f"❌ Download failed: {str(e)}")
+    if not downloaded:
+        await message.reply_text("❌ Could not download the file. Please try again.")
         return
 
-    await msg.edit_text("☁️ Uploading to Google Drive...")
-
+    # Upload to Google Drive
+    status_msg = await message.reply_text("☁️ Uploading to Google Drive...")
     try:
-        gfile = drive.CreateFile({
-            "title": file_name,
-            "parents": [{"id": DRIVE_FOLDER_ID}]
-        })
-
-        gfile.SetContentFile(local_path)
-        gfile.Upload()
-
-        link = gfile["alternateLink"]
-
-        await message.reply_text(f"✅ Uploaded!\n🔗 {link}")
-
+        link = upload_to_drive(drive, local_path, filename)
+        await status_msg.edit_text(
+            f"✅ *Uploaded!*\n"
+            f"🔗 [View on Google Drive]({link})",
+            parse_mode="Markdown"
+        )
+        logger.info(f"Uploaded: {filename} ({size_mb} MB)")
     except Exception as e:
-        await message.reply_text(f"❌ Upload failed: {str(e)}")
-
+        logger.error(f"Drive upload failed: {e}")
+        await status_msg.edit_text(f"❌ Google Drive upload failed:\n`{str(e)}`", parse_mode="Markdown")
     finally:
         if os.path.exists(local_path):
             os.remove(local_path)
 
-# ───── RUN BOT ─────
-app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
-app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
+def main():
+    logger.info("Authenticating with Google Drive...")
+    drive = get_drive()
+    logger.info("✅ Google Drive ready")
 
-print("🤖 Bot is running...")
+    app = (
+        ApplicationBuilder()
+        .token(TELEGRAM_TOKEN)
+        .base_url(LOCAL_API_URL)   # Use local API server
+        .local_mode(True)          # Enable local mode for large files
+        .build()
+    )
 
-app.run_polling()
+    app.bot_data["drive"] = drive
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(
+        filters.Document.ALL | filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE,
+        handle_file
+    ))
+
+    logger.info("🤖 Bot is running...")
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
