@@ -1,6 +1,7 @@
 import os
 import logging
 import subprocess
+import asyncio
 import httpx
 from dotenv import load_dotenv
 from googleapiclient.discovery import build
@@ -18,6 +19,7 @@ DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID", "root")
 LOCAL_API_URL = "http://localhost:8081/bot"
 LOCAL_API_DIR = "/var/lib/telegram-bot-api"  # path inside container
 VOLUME_HOST_PATH = "/home/azureuser/telegram-api-data"
+MAX_PARALLEL_UPLOADS = int(os.getenv("MAX_PARALLEL_UPLOADS", "3"))
 
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -83,7 +85,8 @@ async def upload_to_drive(
 
     response = None
     while response is None:
-        status, response = request.next_chunk()
+        # Run blocking chunk upload in a worker thread so multiple uploads can progress in parallel.
+        status, response = await asyncio.to_thread(request.next_chunk)
         if status and progress_callback and file_size:
             uploaded_bytes = int(status.resumable_progress)
             await progress_callback(uploaded_bytes, file_size)
@@ -91,10 +94,12 @@ async def upload_to_drive(
     if progress_callback and file_size:
         await progress_callback(file_size, file_size)
 
-    service.permissions().create(
-        fileId=response["id"],
-        body={"type": "anyone", "role": "reader"}
-    ).execute()
+    await asyncio.to_thread(
+        service.permissions().create(
+            fileId=response["id"],
+            body={"type": "anyone", "role": "reader"}
+        ).execute
+    )
 
     return response.get("webViewLink") or f"https://drive.google.com/file/d/{response['id']}/view?usp=drivesdk"
 
@@ -214,6 +219,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     drive = context.bot_data.get("drive")
+    upload_semaphore = context.bot_data.get("upload_semaphore")
 
     # Detect file type
     if message.document:
@@ -335,13 +341,30 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Upload to Google Drive
     await update_upload_progress(0, file_size or 0)
     try:
-        link = await upload_to_drive(
-            drive,
-            local_path,
-            filename,
-            file_size=file_size or 0,
-            progress_callback=update_upload_progress
-        )
+        if upload_semaphore:
+            await progress_msg.edit_text(
+                f"{emoji} {filename}\n"
+                f"📦 {size_mb} MB\n\n"
+                f"⏳ Waiting for upload slot..."
+            )
+
+            async with upload_semaphore:
+                await update_upload_progress(0, file_size or 0)
+                link = await upload_to_drive(
+                    drive,
+                    local_path,
+                    filename,
+                    file_size=file_size or 0,
+                    progress_callback=update_upload_progress
+                )
+        else:
+            link = await upload_to_drive(
+                drive,
+                local_path,
+                filename,
+                file_size=file_size or 0,
+                progress_callback=update_upload_progress
+            )
         await progress_msg.edit_text(
             f"✅ *Uploaded!*\n"
             f"🔗 [View on Google Drive]({link})",
@@ -367,10 +390,12 @@ def main():
         .token(TELEGRAM_TOKEN)
         .base_url(LOCAL_API_URL)   # Use local API server
         .local_mode(True)          # Enable local mode for large files
+        .concurrent_updates(True)
         .build()
     )
 
     app.bot_data["drive"] = drive
+    app.bot_data["upload_semaphore"] = asyncio.Semaphore(MAX_PARALLEL_UPLOADS)
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(
@@ -378,7 +403,7 @@ def main():
         handle_file
     ))
 
-    logger.info("🤖 Bot is running...")
+    logger.info(f"🤖 Bot is running... (parallel uploads: {MAX_PARALLEL_UPLOADS})")
     app.run_polling()
 
 
