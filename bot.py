@@ -2,6 +2,7 @@ import os
 import logging
 import subprocess
 import asyncio
+import uuid
 import httpx
 from dotenv import load_dotenv
 from googleapiclient.discovery import build
@@ -28,6 +29,10 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+
+class TransferCancelled(Exception):
+    pass
 
 
 def progress_bar(percent: int, width: int = 12) -> str:
@@ -122,7 +127,8 @@ async def upload_to_drive(
     filepath: str,
     filename: str,
     file_size: int,
-    progress_callback=None
+    progress_callback=None,
+    should_cancel=None
 ):
     http = drive.auth.Get_Http_Object()
     service = build("drive", "v3", http=http, cache_discovery=False)
@@ -145,6 +151,9 @@ async def upload_to_drive(
 
     response = None
     while response is None:
+        if should_cancel and should_cancel():
+            raise TransferCancelled("Upload cancelled by user")
+
         # Run blocking chunk upload in a worker thread so multiple uploads can progress in parallel.
         status, response = await asyncio.to_thread(request.next_chunk)
         if status and progress_callback and file_size:
@@ -169,7 +178,8 @@ async def download_via_local_api(
     file_id: str,
     local_path: str,
     file_size: int = 0,
-    progress_callback=None
+    progress_callback=None,
+    should_cancel=None
 ) -> bool:
     """Read file directly from the Docker volume on disk — no HTTP needed."""
     try:
@@ -203,6 +213,8 @@ async def download_via_local_api(
                 chunk = src.read(chunk_size)
                 if not chunk:
                     break
+                if should_cancel and should_cancel():
+                    raise TransferCancelled("Download cancelled by user")
                 dst.write(chunk)
                 downloaded += len(chunk)
                 if progress_callback and file_size:
@@ -213,6 +225,8 @@ async def download_via_local_api(
         logger.info(f"✅ Copied from volume: {local_path}")
         return True
 
+    except TransferCancelled:
+        raise
     except Exception as e:
         logger.warning(f"Local volume read failed: {e}")
         return False
@@ -222,7 +236,8 @@ async def download_via_cdn(
     file_id: str,
     local_path: str,
     file_size: int = 0,
-    progress_callback=None
+    progress_callback=None,
+    should_cancel=None
 ) -> bool:
     """Fallback: standard Telegram CDN (20MB limit only).
     We call the PUBLIC api.telegram.org here — NOT the local server —
@@ -251,6 +266,8 @@ async def download_via_cdn(
                 response.raise_for_status()
                 with open(local_path, "wb") as f:
                     async for chunk in response.aiter_bytes(chunk_size=1024 * 1024):
+                        if should_cancel and should_cancel():
+                            raise TransferCancelled("Download cancelled by user")
                         f.write(chunk)
                         downloaded += len(chunk)
                         if progress_callback and file_size:
@@ -262,6 +279,8 @@ async def download_via_cdn(
         logger.info(f"✅ Downloaded via CDN: {local_path}")
         return True
 
+    except TransferCancelled:
+        raise
     except Exception as e:
         logger.warning(f"CDN download failed: {e}")
         return False
@@ -914,6 +933,28 @@ async def handle_rename_input(update: Update, context: ContextTypes.DEFAULT_TYPE
         await message.reply_text(f"❌ Rename failed:\n`{str(e)}`", parse_mode="Markdown")
 
 
+async def cancel_transfer_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = update.effective_user
+
+    if not user or user.id != OWNER_ID:
+        await query.answer("Unauthorized", show_alert=True)
+        return
+
+    data = query.data or ""
+    if not data.startswith("cancel_"):
+        await query.answer()
+        return
+
+    task_id = data[len("cancel_"):]
+    cancel_flags = context.bot_data.setdefault("cancel_tasks", {})
+    if task_id in cancel_flags:
+        cancel_flags[task_id] = True
+        await query.answer("Cancelling...")
+    else:
+        await query.answer("Task not found or already finished", show_alert=True)
+
+
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     drive = context.bot_data.get("drive")
@@ -958,11 +999,25 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     size_mb = round(file_size / (1024 * 1024), 2) if file_size else "?"
     local_path = f"/tmp/{filename}"
+    task_id = f"{file_id}_{uuid.uuid4().hex[:8]}"
+    cancel_flags = context.bot_data.setdefault("cancel_tasks", {})
+    cancel_flags[task_id] = False
+    cancel_keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{task_id}")]
+    ])
+
+    def is_cancelled() -> bool:
+        return bool(context.bot_data.get("cancel_tasks", {}).get(task_id, False))
+
+    def cleanup_local_file():
+        if os.path.exists(local_path):
+            os.remove(local_path)
 
     progress_msg = await message.reply_text(
         f"{emoji} {filename}\n"
         f"📦 {size_mb} MB\n\n"
-        f"⬇️ Downloading... 0%"
+        f"⬇️ Downloading... 0%",
+        reply_markup=cancel_keyboard
     )
 
     progress_state = {"download": -1, "upload": -1}
@@ -983,7 +1038,8 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"📦 {size_mb} MB\n\n"
                 f"⬇️ Downloading... {percent}%\n"
                 f"{bar}\n"
-                f"{done_mb:.2f}/{total_mb:.2f} MB"
+                f"{done_mb:.2f}/{total_mb:.2f} MB",
+                reply_markup=cancel_keyboard
             )
         except Exception:
             pass
@@ -1004,18 +1060,26 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"📦 {size_mb} MB\n\n"
                 f"☁️ Uploading to Google Drive... {percent}%\n"
                 f"{bar}\n"
-                f"{done_mb:.2f}/{total_mb:.2f} MB"
+                f"{done_mb:.2f}/{total_mb:.2f} MB",
+                reply_markup=cancel_keyboard
             )
         except Exception:
             pass
 
-    # Try local API first (supports up to 2GB)
-    downloaded = await download_via_local_api(
-        file_id,
-        local_path,
-        file_size=file_size or 0,
-        progress_callback=update_download_progress
-    )
+    try:
+        # Try local API first (supports up to 2GB)
+        downloaded = await download_via_local_api(
+            file_id,
+            local_path,
+            file_size=file_size or 0,
+            progress_callback=update_download_progress,
+            should_cancel=is_cancelled
+        )
+    except TransferCancelled:
+        cleanup_local_file()
+        await progress_msg.edit_text("❌ Cancelled")
+        context.bot_data.get("cancel_tasks", {}).pop(task_id, None)
+        return
 
     # Fallback to CDN only for files under 20MB
     if not downloaded:
@@ -1028,18 +1092,27 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown"
             )
             logger.error(f"Local API failed and file is too large for CDN ({size_mb} MB)")
+            context.bot_data.get("cancel_tasks", {}).pop(task_id, None)
             return
 
         logger.info("Falling back to Telegram CDN (file is under 20MB)...")
-        downloaded = await download_via_cdn(
-            file_id,
-            local_path,
-            file_size=file_size or 0,
-            progress_callback=update_download_progress
-        )
+        try:
+            downloaded = await download_via_cdn(
+                file_id,
+                local_path,
+                file_size=file_size or 0,
+                progress_callback=update_download_progress,
+                should_cancel=is_cancelled
+            )
+        except TransferCancelled:
+            cleanup_local_file()
+            await progress_msg.edit_text("❌ Cancelled")
+            context.bot_data.get("cancel_tasks", {}).pop(task_id, None)
+            return
 
     if not downloaded:
         await message.reply_text("❌ Could not download the file. Please try again.")
+        context.bot_data.get("cancel_tasks", {}).pop(task_id, None)
         return
 
     # Upload to Google Drive
@@ -1049,7 +1122,8 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await progress_msg.edit_text(
                 f"{emoji} {filename}\n"
                 f"📦 {size_mb} MB\n\n"
-                f"⏳ Waiting for upload slot..."
+                f"⏳ Waiting for upload slot...",
+                reply_markup=cancel_keyboard
             )
 
             async with upload_semaphore:
@@ -1059,7 +1133,8 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     local_path,
                     filename,
                     file_size=file_size or 0,
-                    progress_callback=update_upload_progress
+                    progress_callback=update_upload_progress,
+                    should_cancel=is_cancelled
                 )
         else:
             uploaded_file_id, link = await upload_to_drive(
@@ -1067,7 +1142,8 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 local_path,
                 filename,
                 file_size=file_size or 0,
-                progress_callback=update_upload_progress
+                progress_callback=update_upload_progress,
+                should_cancel=is_cancelled
             )
         http = drive.auth.Get_Http_Object()
         service = build("drive", "v3", http=http, cache_discovery=False)
@@ -1075,12 +1151,16 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await progress_msg.edit_text("✅ Uploaded!", reply_markup=upload_keyboard)
         logger.info(f"Uploaded: {filename} ({size_mb} MB)")
+    except TransferCancelled:
+        cleanup_local_file()
+        await progress_msg.edit_text("❌ Cancelled")
+        return
     except Exception as e:
         logger.error(f"Drive upload failed: {e}")
         await progress_msg.edit_text(f"❌ Google Drive upload failed:\n`{str(e)}`", parse_mode="Markdown")
     finally:
-        if os.path.exists(local_path):
-            os.remove(local_path)
+        cleanup_local_file()
+        context.bot_data.get("cancel_tasks", {}).pop(task_id, None)
 
 
 def main():
@@ -1105,6 +1185,7 @@ def main():
     app.add_handler(CommandHandler("storage", storage))
     app.add_handler(CommandHandler("files", files))
     app.add_handler(CommandHandler("search", search))
+    app.add_handler(CallbackQueryHandler(cancel_transfer_callback, pattern=r"^cancel_"))
     app.add_handler(CallbackQueryHandler(files_callback_handler, pattern=r"^(page_|file_|delpage_|delete_|back_|rename_|public_|private_|search:|sfile:|sback:|sdel:)"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_rename_input))
     app.add_handler(MessageHandler(
