@@ -74,6 +74,20 @@ def format_size(size_bytes) -> str:
     return f"{size:.1f} {units[unit_idx]}"
 
 
+def format_bytes_stats(num_bytes) -> str:
+    try:
+        value = float(num_bytes)
+    except (TypeError, ValueError):
+        return "0.00 MB"
+
+    gb = value / (1024 ** 3)
+    if gb >= 1:
+        return f"{gb:.2f} GB"
+
+    mb = value / (1024 ** 2)
+    return f"{mb:.2f} MB"
+
+
 def clean_drive_file_url(file_id: str) -> str:
     return f"https://drive.google.com/file/d/{file_id}/view"
 
@@ -355,6 +369,59 @@ async def storage(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Storage command failed: {e}")
         await message.reply_text(f"❌ Could not fetch storage info:\n`{str(e)}`", parse_mode="Markdown")
+
+
+async def stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    user = update.effective_user
+
+    if not user or user.id != OWNER_ID:
+        await message.reply_text("❌ Unauthorized access")
+        return
+
+    try:
+        drive = context.bot_data.get("drive")
+        http = drive.auth.Get_Http_Object()
+        service = build("drive", "v3", http=http, cache_discovery=False)
+
+        about = await asyncio.to_thread(
+            service.about().get(fields="storageQuota").execute
+        )
+        quota = about.get("storageQuota", {})
+        usage = int(quota.get("usage", 0))
+        limit = int(quota.get("limit", 0))
+        free = max(limit - usage, 0) if limit > 0 else 0
+
+        total_files = 0
+        page_token = None
+        while True:
+            resp = await asyncio.to_thread(
+                service.files().list(
+                    q=f"'{DRIVE_FOLDER_ID}' in parents and trashed = false",
+                    fields="nextPageToken,files(id)",
+                    pageSize=1000,
+                    pageToken=page_token
+                ).execute
+            )
+            total_files += len(resp.get("files", []))
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
+
+        used_text = format_bytes_stats(usage)
+        limit_text = "Unlimited" if limit <= 0 else format_bytes_stats(limit)
+        free_text = "Unlimited" if limit <= 0 else format_bytes_stats(free)
+
+        text = (
+            "📊 Drive Stats\n"
+            f"Used: {used_text} / {limit_text}\n"
+            f"Free: {free_text}\n"
+            f"Files: {total_files}"
+        )
+        await message.reply_text(text)
+    except Exception as e:
+        logger.error(f"Stats command failed: {e}")
+        await message.reply_text(f"❌ Could not fetch stats:\n`{str(e)}`", parse_mode="Markdown")
 
 
 async def files(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1159,6 +1226,7 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("storage", storage))
+    app.add_handler(CommandHandler("stats", stats_handler))
     app.add_handler(CommandHandler("files", files))
     app.add_handler(CommandHandler("search", search))
     app.add_handler(CallbackQueryHandler(cancel_transfer_callback, pattern=r"^cancel_"))
