@@ -48,7 +48,11 @@ def upload_to_drive_with_progress(filepath, filename, progress_message):
         "parents": [DRIVE_FOLDER_ID]
     }
 
-    media = MediaFileUpload(filepath, resumable=True)
+    media = MediaFileUpload(
+        filepath,
+        resumable=True,
+        chunksize=5 * 1024 * 1024
+    )
 
     request = drive_service.files().create(
         body=file_metadata,
@@ -61,7 +65,12 @@ def upload_to_drive_with_progress(filepath, filename, progress_message):
     last_update = 0
 
     while response is None:
-        status, response = request.next_chunk()
+        try:
+            status, response = request.next_chunk()
+        except Exception as e:
+            print("Retrying...", e)
+            time.sleep(2)
+            continue
 
         if status:
             progress = int(status.progress() * 100)
