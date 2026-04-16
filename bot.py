@@ -15,7 +15,7 @@ from urllib.parse import urlparse, unquote
 from dotenv import load_dotenv
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from googleapiclient.http import MediaFileUpload
+from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, CallbackQueryHandler, filters, ContextTypes
 from pydrive2.auth import GoogleAuth
@@ -1148,6 +1148,142 @@ async def stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Stats command failed: {e}")
         await message.reply_text(f"❌ Could not fetch stats:\n`{str(e)}`", parse_mode="Markdown")
+
+
+async def find_drive_file(service, query_text: str):
+    query_text = (query_text or "").strip()
+    if not query_text:
+        return None
+
+    # Try as file ID first.
+    if re.fullmatch(r"[A-Za-z0-9_-]{10,}", query_text):
+        try:
+            by_id = await asyncio.to_thread(
+                service.files().get(
+                    fileId=query_text,
+                    fields="id,name,size,parents,trashed"
+                ).execute
+            )
+            if not by_id.get("trashed") and DRIVE_FOLDER_ID in (by_id.get("parents") or []):
+                return {
+                    "id": by_id.get("id"),
+                    "name": by_id.get("name", "Unnamed file"),
+                    "size": int(by_id.get("size", 0) or 0),
+                }
+        except Exception:
+            pass
+
+    safe_query = escape_drive_query_value(query_text)
+    result = await asyncio.to_thread(
+        service.files().list(
+            q=(
+                f"name contains '{safe_query}' and "
+                f"'{DRIVE_FOLDER_ID}' in parents and trashed=false"
+            ),
+            orderBy="createdTime desc",
+            pageSize=1,
+            fields="files(id,name,size)"
+        ).execute
+    )
+    items = result.get("files", [])
+    if not items:
+        return None
+
+    item = items[0]
+    return {
+        "id": item.get("id"),
+        "name": item.get("name", "Unnamed file"),
+        "size": int(item.get("size", 0) or 0),
+    }
+
+
+async def download_drive_file(service, file_id: str, local_path: str, progress_callback=None):
+    request = service.files().get_media(fileId=file_id)
+    with open(local_path, "wb") as fh:
+        downloader = MediaIoBaseDownload(fh, request)
+        done = False
+        while not done:
+            status, done = await asyncio.to_thread(downloader.next_chunk)
+            if progress_callback and status:
+                try:
+                    await progress_callback(int(status.progress() * 100))
+                except Exception:
+                    pass
+
+
+async def get_file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    user = update.effective_user
+
+    if not user or user.id != OWNER_ID:
+        await message.reply_text("❌ Unauthorized access")
+        return
+
+    query = " ".join(context.args).strip()
+    if not query:
+        await message.reply_text("Usage: /get <file_name OR file_id>")
+        return
+
+    drive = context.bot_data.get("drive")
+    http = drive.auth.Get_Http_Object()
+    service = build("drive", "v3", http=http, cache_discovery=False)
+
+    try:
+        found = await find_drive_file(service, query)
+    except Exception as e:
+        logger.error(f"Drive search failed in /get: {e}")
+        await message.reply_text("❌ Could not search Google Drive")
+        return
+
+    if not found or not found.get("id"):
+        await message.reply_text("❌ File not found")
+        return
+
+    file_id = found["id"]
+    file_name = found.get("name", "file")
+    safe_name = sanitize_filename(file_name, fallback=f"file_{file_id[:8]}")
+    local_path = f"/tmp/get_{uuid.uuid4().hex[:8]}_{safe_name}"
+
+    progress_msg = await message.reply_text(
+        f"⬇️ Downloading from Drive... 0%\n📄 {file_name}"
+    )
+    last_update = {"ts": 0.0}
+
+    async def progress(percent: int):
+        now = time.time()
+        if percent < 100 and now - last_update["ts"] < 1.0:
+            return
+        last_update["ts"] = now
+        try:
+            await progress_msg.edit_text(
+                f"⬇️ Downloading from Drive... {percent}%\n"
+                f"📄 {file_name}"
+            )
+        except Exception:
+            pass
+
+    try:
+        await download_drive_file(service, file_id, local_path, progress_callback=progress)
+
+        with open(local_path, "rb") as fh:
+            await message.reply_document(document=fh, filename=file_name)
+
+        try:
+            await progress_msg.edit_text(f"✅ Sent: {file_name}")
+        except Exception:
+            pass
+    except HttpError as e:
+        logger.error(f"Drive download failed (API): {e}")
+        await message.reply_text("❌ Download failed. The file may be inaccessible.")
+    except Exception as e:
+        logger.error(f"Drive download failed in /get: {e}")
+        await message.reply_text("❌ Failed to download/send file")
+    finally:
+        if os.path.exists(local_path):
+            try:
+                os.remove(local_path)
+            except Exception:
+                pass
 
 
 async def analytics_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2555,6 +2691,7 @@ def main():
     app.add_handler(CommandHandler("storage", storage))
     app.add_handler(CommandHandler("stats", stats_handler))
     app.add_handler(CommandHandler("analytics", analytics_handler))
+    app.add_handler(CommandHandler("get", get_file_handler))
     app.add_handler(CommandHandler("files", files))
     app.add_handler(CommandHandler("search", search))
     app.add_handler(CallbackQueryHandler(pause_transfer_callback, pattern=r"^pause_"))
