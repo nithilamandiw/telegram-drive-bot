@@ -9,7 +9,7 @@ A powerful Telegram bot to upload, manage, and share files directly with Google 
 ### 📤 Upload System
 
 * Upload files directly from Telegram
-* Supports **large files (>20MB)** using Local Bot API
+* Supports **large files (UP TO 2GB)** using Local Bot API
 * Parallel uploads (configurable)
 * Progress bar with:
 
