@@ -689,7 +689,7 @@ def get_file_md5(file_path: str) -> str:
     return hash_md5.hexdigest()
 
 
-def check_duplicate(drive, file_path: str, filename: str, file_size: int | None):
+async def check_duplicate(service, file_path: str, filename: str, file_size: int | None):
     if not file_path or not filename or not file_size:
         return None
 
@@ -701,35 +701,62 @@ def check_duplicate(drive, file_path: str, filename: str, file_size: int | None)
     if local_size <= 0:
         return None
 
-    local_md5 = get_file_md5(file_path)
-    normalized_name = (filename or "").strip()
-    print("LOCAL:", filename, local_size, local_md5)
+    local_md5 = None
+    try:
+        local_md5 = await asyncio.to_thread(get_file_md5, file_path)
+    except Exception as e:
+        logger.warning(f"Could not compute local MD5 for duplicate check: {e}")
 
-    file_list = drive.ListFile({
-        "q": f"'{DRIVE_FOLDER_ID}' in parents and trashed=false"
-    }).GetList()
+    normalized_name = (filename or "").strip().lower()
+    name_stem = os.path.splitext(normalized_name)[0]
+    size_tolerance = max(1, int(local_size * 0.01))
 
-    for item in file_list:
-        drive_name = item.get("title") or item.get("name") or ""
-        drive_md5 = item.get("md5Checksum")
+    logger.debug(f"LOCAL: {filename} {local_size} {local_md5}")
 
-        size_raw = item.get("fileSize") or item.get("size")
-        drive_size = 0
-        if size_raw is not None:
+    page_token = None
+    while True:
+        result = await asyncio.to_thread(
+            service.files().list(
+                q=f"'{DRIVE_FOLDER_ID}' in parents and trashed=false",
+                fields="nextPageToken,files(id,name,size,md5Checksum)",
+                pageSize=1000,
+                pageToken=page_token
+            ).execute
+        )
+
+        for item in result.get("files", []):
+            drive_name = (item.get("name") or "").strip()
+            drive_md5 = item.get("md5Checksum")
+            logger.debug(f"CHECKING: {drive_name} {drive_md5}")
+
+            # Primary match: exact checksum match.
+            if local_md5 and drive_md5 and drive_md5 == local_md5:
+                return item.get("id")
+
+            # Fallback: flexible name match with small size tolerance.
+            size_raw = item.get("size")
+            if size_raw is None:
+                continue
+
             try:
                 drive_size = int(size_raw)
             except (TypeError, ValueError):
-                drive_size = 0
+                continue
 
-        print("CHECKING:", drive_name, drive_size, drive_md5)
+            drive_name_norm = drive_name.lower()
+            drive_stem = os.path.splitext(drive_name_norm)[0]
+            name_match = (
+                drive_name_norm == normalized_name
+                or drive_stem == name_stem
+                or (name_stem and name_stem in drive_stem)
+            )
+            size_match = abs(drive_size - local_size) <= size_tolerance
+            if name_match and size_match:
+                return item.get("id")
 
-        # Primary match: exact checksum match.
-        if drive_md5 and drive_md5 == local_md5:
-            return item.get("id")
-
-        # Fallback match: exact name + exact size.
-        if drive_size > 0 and drive_name == normalized_name and drive_size == local_size:
-            return item.get("id")
+        page_token = result.get("nextPageToken")
+        if not page_token:
+            break
 
     return None
 
@@ -2396,9 +2423,11 @@ async def run_transfer_pipeline(
     except Exception as e:
         logger.warning(f"Failed to update download analytics: {e}")
 
-    # Duplicate detection before upload: MD5 first, then name+size fallback.
+    # Duplicate detection before upload.
     try:
-        existing_id = await asyncio.to_thread(check_duplicate, drive, local_path, filename, known_size)
+        http = drive.auth.Get_Http_Object()
+        service = build("drive", "v3", http=http, cache_discovery=False)
+        existing_id = await check_duplicate(service, local_path, filename, known_size)
     except Exception as e:
         logger.warning(f"Duplicate check failed, continuing upload: {e}")
         existing_id = None
