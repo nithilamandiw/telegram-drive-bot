@@ -2,7 +2,6 @@ import os
 import json
 import re
 import logging
-import hashlib
 import subprocess
 import asyncio
 import uuid
@@ -681,16 +680,8 @@ async def send_uploaded_ui(
         await target_message.reply_text("✅ Uploaded!", reply_markup=upload_keyboard)
 
 
-def get_file_md5(file_path: str) -> str:
-    hash_md5 = hashlib.md5()
-    with open(file_path, "rb") as f:
-        for chunk in iter(lambda: f.read(4096), b""):
-            hash_md5.update(chunk)
-    return hash_md5.hexdigest()
-
-
-async def check_duplicate(service, file_path: str, filename: str, file_size: int | None):
-    if not file_path or not filename or not file_size:
+async def check_duplicate(service, filename: str, file_size: int | None):
+    if not filename or file_size is None:
         return None
 
     try:
@@ -701,62 +692,38 @@ async def check_duplicate(service, file_path: str, filename: str, file_size: int
     if local_size <= 0:
         return None
 
-    local_md5 = None
-    try:
-        local_md5 = await asyncio.to_thread(get_file_md5, file_path)
-    except Exception as e:
-        logger.warning(f"Could not compute local MD5 for duplicate check: {e}")
+    normalized_name = (filename or "").strip()
+    query = (
+        f"name contains '{escape_drive_query_value(normalized_name)}' and "
+        f"'{DRIVE_FOLDER_ID}' in parents and trashed=false"
+    )
 
-    normalized_name = (filename or "").strip().lower()
-    name_stem = os.path.splitext(normalized_name)[0]
-    size_tolerance = max(1, int(local_size * 0.01))
+    result = await asyncio.to_thread(
+        service.files().list(
+            q=query,
+            fields="files(id,name,size)",
+            pageSize=100
+        ).execute
+    )
 
-    logger.debug(f"LOCAL: {filename} {local_size} {local_md5}")
+    print("LOCAL:", normalized_name, local_size)
 
-    page_token = None
-    while True:
-        result = await asyncio.to_thread(
-            service.files().list(
-                q=f"'{DRIVE_FOLDER_ID}' in parents and trashed=false",
-                fields="nextPageToken,files(id,name,size,md5Checksum)",
-                pageSize=1000,
-                pageToken=page_token
-            ).execute
-        )
+    for item in result.get("files", []):
+        print("DRIVE:", item.get("name"), item.get("size"))
+        drive_name = (item.get("name") or "").strip()
+        if drive_name != normalized_name:
+            continue
 
-        for item in result.get("files", []):
-            drive_name = (item.get("name") or "").strip()
-            drive_md5 = item.get("md5Checksum")
-            logger.debug(f"CHECKING: {drive_name} {drive_md5}")
+        size_raw = item.get("size")
+        if size_raw is None:
+            continue
 
-            # Primary match: exact checksum match.
-            if local_md5 and drive_md5 and drive_md5 == local_md5:
+        try:
+            drive_size = int(size_raw)
+            if drive_size == local_size:
                 return item.get("id")
-
-            # Fallback: flexible name match with small size tolerance.
-            size_raw = item.get("size")
-            if size_raw is None:
-                continue
-
-            try:
-                drive_size = int(size_raw)
-            except (TypeError, ValueError):
-                continue
-
-            drive_name_norm = drive_name.lower()
-            drive_stem = os.path.splitext(drive_name_norm)[0]
-            name_match = (
-                drive_name_norm == normalized_name
-                or drive_stem == name_stem
-                or (name_stem and name_stem in drive_stem)
-            )
-            size_match = abs(drive_size - local_size) <= size_tolerance
-            if name_match and size_match:
-                return item.get("id")
-
-        page_token = result.get("nextPageToken")
-        if not page_token:
-            break
+        except (TypeError, ValueError):
+            continue
 
     return None
 
@@ -2423,11 +2390,11 @@ async def run_transfer_pipeline(
     except Exception as e:
         logger.warning(f"Failed to update download analytics: {e}")
 
-    # Duplicate detection before upload.
+    # Duplicate detection by exact filename and size before upload.
     try:
         http = drive.auth.Get_Http_Object()
         service = build("drive", "v3", http=http, cache_discovery=False)
-        existing_id = await check_duplicate(service, local_path, filename, known_size)
+        existing_id = await check_duplicate(service, filename, known_size)
     except Exception as e:
         logger.warning(f"Duplicate check failed, continuing upload: {e}")
         existing_id = None
