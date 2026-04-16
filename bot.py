@@ -33,6 +33,7 @@ VOLUME_HOST_PATH = "/home/azureuser/telegram-api-data"
 MAX_PARALLEL_UPLOADS = int(os.getenv("MAX_PARALLEL_UPLOADS", "3"))
 ANALYTICS_FILE = "analytics.json"
 USERS_FILE = "users.json"
+ADMINS_FILE = "admins.json"
 URL_PATTERN = re.compile(r"(https?://\S+)", re.IGNORECASE)
 DRIVE_FILE_ID_PATTERN = re.compile(r"(?:/d/|id=)([a-zA-Z0-9_-]+)")
 MAX_URL_DOWNLOAD_SIZE = int(os.getenv("MAX_URL_DOWNLOAD_SIZE", str(2 * 1024 * 1024 * 1024)))
@@ -165,40 +166,70 @@ async def check_storage(context: ContextTypes.DEFAULT_TYPE):
     context.bot_data["last_storage_alert"] = now
 
 
-def load_allowed_users() -> set[int]:
-    if not os.path.exists(USERS_FILE):
+def load_id_set(file_path: str) -> set[int]:
+    if not os.path.exists(file_path):
         return set()
     try:
-        with open(USERS_FILE, "r", encoding="utf-8") as f:
+        with open(file_path, "r", encoding="utf-8") as f:
             raw = json.load(f)
         if not isinstance(raw, list):
             return set()
         return {int(x) for x in raw}
     except Exception as e:
-        logger.warning(f"Failed to load {USERS_FILE}: {e}")
+        logger.warning(f"Failed to load {file_path}: {e}")
         return set()
 
 
-def save_allowed_users(users: set[int]):
+def save_id_set(file_path: str, values: set[int]):
     try:
-        with open(USERS_FILE, "w", encoding="utf-8") as f:
-            json.dump(sorted(list(users)), f)
+        with open(file_path, "w", encoding="utf-8") as f:
+            json.dump(sorted(list(values)), f)
     except Exception as e:
-        logger.warning(f"Failed to save {USERS_FILE}: {e}")
+        logger.warning(f"Failed to save {file_path}: {e}")
 
 
-def is_allowed(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    if user_id == OWNER_ID:
-        return True
+def load_allowed_users() -> set[int]:
+    return load_id_set(USERS_FILE)
 
+
+def save_allowed_users(users: set[int]):
+    save_id_set(USERS_FILE, users)
+
+
+def load_admin_users() -> set[int]:
+    return load_id_set(ADMINS_FILE)
+
+
+def save_admin_users(admins: set[int]):
+    save_id_set(ADMINS_FILE, admins)
+
+
+def is_owner(user_id: int) -> bool:
+    return user_id == OWNER_ID
+
+
+def is_admin(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    admins = context.bot_data.get("admins", set())
+    if not isinstance(admins, set):
+        admins = set(admins or [])
+        context.bot_data["admins"] = admins
+    return user_id in admins
+
+
+def is_user(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
     users = context.bot_data.get("users", set())
     if not isinstance(users, set):
         users = set(users or [])
         context.bot_data["users"] = users
-
-    print("Allowed users:", context.bot_data.get("users"))
-    print("Current user:", user_id)
     return user_id in users
+
+
+def can_manage_files(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    return is_owner(user_id) or is_admin(user_id, context)
+
+
+def can_manage_users(user_id: int) -> bool:
+    return is_owner(user_id)
 
 
 def default_analytics_data() -> dict:
