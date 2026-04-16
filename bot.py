@@ -1228,16 +1228,44 @@ async def get_file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     http = drive.auth.Get_Http_Object()
     service = build("drive", "v3", http=http, cache_discovery=False)
 
-    try:
-        found = await find_drive_file(service, query)
-    except Exception as e:
-        logger.error(f"Drive search failed in /get: {e}")
-        await message.reply_text("❌ Could not search Google Drive")
-        return
+    found = None
+    if is_google_drive_link(query):
+        direct_file_id = extract_drive_file_id(query)
+        if not direct_file_id:
+            await message.reply_text("❌ Invalid Google Drive link")
+            return
 
-    if not found or not found.get("id"):
-        await message.reply_text("❌ File not found")
-        return
+        try:
+            direct_item = await asyncio.to_thread(
+                service.files().get(
+                    fileId=direct_file_id,
+                    fields="id,name,size"
+                ).execute
+            )
+            found = {
+                "id": direct_item.get("id"),
+                "name": direct_item.get("name", "Unnamed file"),
+                "size": int(direct_item.get("size", 0) or 0),
+            }
+        except HttpError as e:
+            logger.error(f"Drive /get direct link failed (API): {e}")
+            await message.reply_text("❌ Could not access file from link")
+            return
+        except Exception as e:
+            logger.error(f"Drive /get direct link failed: {e}")
+            await message.reply_text("❌ Failed to parse/download from Drive link")
+            return
+    else:
+        try:
+            found = await find_drive_file(service, query)
+        except Exception as e:
+            logger.error(f"Drive search failed in /get: {e}")
+            await message.reply_text("❌ Could not search Google Drive")
+            return
+
+        if not found or not found.get("id"):
+            await message.reply_text("❌ File not found")
+            return
 
     file_id = found["id"]
     file_name = found.get("name", "file")
