@@ -21,7 +21,7 @@ from pydrive2.drive import GoogleDrive
 
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-DRIVE_FOLDER_ID = (os.getenv("DRIVE_FOLDER_ID") or "").strip().strip('"').strip("'")
+DRIVE_FOLDER_ID = (os.getenv("DRIVE_FOLDER_ID") or "").strip()
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 
 # Local Bot API server URL (running via Docker)
@@ -721,34 +721,35 @@ async def upload_to_drive(
 
     print("Uploading to folder:", DRIVE_FOLDER_ID)
     try:
-        folder_items = await asyncio.to_thread(
+        files = await asyncio.to_thread(
             lambda: drive.ListFile({
                 "q": f"'{DRIVE_FOLDER_ID}' in parents and trashed=false"
             }).GetList()
         )
-        print("Files in folder:", len(folder_items))
+        print("FILES IN FOLDER:", len(files))
     except Exception as e:
-        logger.warning(f"Folder access check failed before upload: {e}")
+        logger.warning(f"Folder pre-check failed: {e}")
 
     def _upload_file():
         gfile = drive.CreateFile({
             "title": filename,
             "parents": [{"id": DRIVE_FOLDER_ID}]
         })
-        # Force parent assignment to guard against metadata override.
+        # Re-assert parents to prevent accidental metadata override.
         gfile["parents"] = [{"id": DRIVE_FOLDER_ID}]
         gfile.SetContentFile(filepath)
         gfile.Upload()
         return gfile
 
     gfile = await asyncio.to_thread(_upload_file)
+    print("Uploaded file ID:", gfile.get("id"))
 
     if progress_callback and file_size:
         await progress_callback(file_size, file_size)
 
     file_id = gfile.get("id")
     if not file_id:
-        raise RuntimeError("Upload succeeded but no file id was returned")
+        raise RuntimeError("Upload completed but file id is missing")
 
     http = drive.auth.Get_Http_Object()
     service = build("drive", "v3", http=http, cache_discovery=False)
