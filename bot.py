@@ -13,7 +13,7 @@ from urllib.parse import urlparse, unquote
 from dotenv import load_dotenv
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
+from googleapiclient.http import MediaIoBaseDownload
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, CallbackQueryHandler, filters, ContextTypes
 from pydrive2.auth import GoogleAuth
@@ -21,7 +21,7 @@ from pydrive2.drive import GoogleDrive
 
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")
+DRIVE_FOLDER_ID = (os.getenv("DRIVE_FOLDER_ID") or "").strip().strip('"').strip("'")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 
 # Local Bot API server URL (running via Docker)
@@ -716,47 +716,49 @@ async def upload_to_drive(
     progress_callback=None,
     should_cancel=None
 ):
-    http = drive.auth.Get_Http_Object()
-    service = build("drive", "v3", http=http, cache_discovery=False)
+    if should_cancel and should_cancel():
+        raise TransferCancelled("Upload cancelled by user")
 
-    media = MediaFileUpload(
-        filepath,
-        resumable=True,
-        chunksize=5 * 1024 * 1024
-    )
-    metadata = {
-        "name": filename,
-        "parents": [{"id": DRIVE_FOLDER_ID}]
-    }
+    print("Uploading to folder:", DRIVE_FOLDER_ID)
+    try:
+        folder_items = await asyncio.to_thread(
+            lambda: drive.ListFile({
+                "q": f"'{DRIVE_FOLDER_ID}' in parents and trashed=false"
+            }).GetList()
+        )
+        print("Files in folder:", len(folder_items))
+    except Exception as e:
+        logger.warning(f"Folder access check failed before upload: {e}")
 
-    request = service.files().create(
-        body=metadata,
-        media_body=media,
-        fields="id,webViewLink"
-    )
+    def _upload_file():
+        gfile = drive.CreateFile({
+            "title": filename,
+            "parents": [{"id": DRIVE_FOLDER_ID}]
+        })
+        # Force parent assignment to guard against metadata override.
+        gfile["parents"] = [{"id": DRIVE_FOLDER_ID}]
+        gfile.SetContentFile(filepath)
+        gfile.Upload()
+        return gfile
 
-    response = None
-    while response is None:
-        if should_cancel and should_cancel():
-            raise TransferCancelled("Upload cancelled by user")
-
-        # Run blocking chunk upload in a worker thread so multiple uploads can progress in parallel.
-        status, response = await asyncio.to_thread(request.next_chunk)
-        if status and progress_callback and file_size:
-            uploaded_bytes = int(status.resumable_progress)
-            await progress_callback(uploaded_bytes, file_size)
+    gfile = await asyncio.to_thread(_upload_file)
 
     if progress_callback and file_size:
         await progress_callback(file_size, file_size)
 
+    file_id = gfile.get("id")
+    if not file_id:
+        raise RuntimeError("Upload succeeded but no file id was returned")
+
+    http = drive.auth.Get_Http_Object()
+    service = build("drive", "v3", http=http, cache_discovery=False)
     await asyncio.to_thread(
         service.permissions().create(
-            fileId=response["id"],
+            fileId=file_id,
             body={"type": "anyone", "role": "reader"}
         ).execute
     )
 
-    file_id = response["id"]
     return file_id, clean_drive_file_url(file_id)
 
 
