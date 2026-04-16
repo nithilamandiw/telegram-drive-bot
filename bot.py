@@ -37,6 +37,32 @@ DRIVE_FILE_ID_PATTERN = re.compile(r"(?:/d/|id=)([a-zA-Z0-9_-]+)")
 MAX_URL_DOWNLOAD_SIZE = int(os.getenv("MAX_URL_DOWNLOAD_SIZE", str(2 * 1024 * 1024 * 1024)))
 DOWNLOADS_DIR = "./downloads"
 
+COMMANDS = {
+    "upload": ("📤 Send file", "Upload files to Drive"),
+    "files": ("📁 /files", "View Drive files"),
+    "stats": ("📊 /stats", "Storage stats"),
+    "url": ("🌐 /url <link>", "Upload from URL"),
+    "get": ("📥 /get <drive_link>", "Download from Drive"),
+    "search": ("🔍 /search <name>", "Search files"),
+    "adduser": ("➕ /adduser <id>", "Add user"),
+    "removeuser": ("➖ /removeuser <id>", "Remove user"),
+    "addadmin": ("👑 /addadmin <id>", "Add admin"),
+    "removeadmin": ("❌ /removeadmin <id>", "Remove admin"),
+}
+
+COMMAND_PERMISSIONS = {
+    "upload": "upload",
+    "files": "files",
+    "stats": "files",
+    "url": "upload",
+    "get": "files",
+    "search": "files",
+    "adduser": "adduser",
+    "removeuser": "removeuser",
+    "addadmin": "addadmin",
+    "removeadmin": "removeadmin",
+}
+
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
     level=logging.INFO
@@ -961,6 +987,31 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "✅ Supports files up to *2GB* via local API server.",
         parse_mode="Markdown"
     )
+
+
+async def commands_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    user = update.effective_user
+
+    if not message or not user:
+        return
+
+    user_id = user.id
+    role = get_role(user_id, context)
+    if not role:
+        await message.reply_text("❌ Unauthorized access")
+        return
+
+    lines = ["📋 Available Commands:", ""]
+    for key, (cmd, desc) in COMMANDS.items():
+        action = COMMAND_PERMISSIONS.get(key)
+        if action and has_permission(user_id, context, action):
+            lines.append(cmd)
+            lines.append(f"   └ {desc}")
+            lines.append("")
+
+    lines.append(f"👤 Role: {role.capitalize()}")
+    await message.reply_text("\n".join(lines))
 
 
 async def storage(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2646,6 +2697,7 @@ def main():
     app.bot_data.setdefault("last_storage_alert", 0.0)
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("commands", commands_handler))
     app.add_handler(CommandHandler("storage", storage))
     app.add_handler(CommandHandler("stats", stats_handler))
     app.add_handler(CommandHandler("analytics", analytics_handler))
