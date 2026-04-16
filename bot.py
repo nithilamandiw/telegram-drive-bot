@@ -2677,8 +2677,9 @@ def main():
         logger.warning("Job queue unavailable; background notifications are disabled")
 
     logger.info(f"🤖 Bot is running... (parallel uploads: {MAX_PARALLEL_UPLOADS})")
-    app.run_polling(drop_pending_updates=True)
+    return app
 
 
 if __name__ == "__main__":
-    main()
+    app = main()
+    app.run_polling()
