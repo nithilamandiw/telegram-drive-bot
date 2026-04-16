@@ -831,11 +831,20 @@ async def send_uploaded_ui(
 
 
 async def check_duplicate(service, filename: str, file_size: int | None):
-    if not filename or not file_size:
+    if not filename or file_size is None:
         return None
 
+    try:
+        local_size = int(file_size)
+    except (TypeError, ValueError):
+        return None
+
+    if local_size <= 0:
+        return None
+
+    normalized_name = (filename or "").strip()
     query = (
-        f"name='{escape_drive_query_value(filename)}' and "
+        f"name contains '{escape_drive_query_value(normalized_name)}' and "
         f"'{DRIVE_FOLDER_ID}' in parents and trashed=false"
     )
 
@@ -847,12 +856,21 @@ async def check_duplicate(service, filename: str, file_size: int | None):
         ).execute
     )
 
+    print("LOCAL:", normalized_name, local_size)
+
     for item in result.get("files", []):
+        print("DRIVE:", item.get("name"), item.get("size"))
+        drive_name = (item.get("name") or "").strip()
+        if drive_name != normalized_name:
+            continue
+
         size_raw = item.get("size")
         if size_raw is None:
             continue
+
         try:
-            if int(size_raw) == int(file_size):
+            drive_size = int(size_raw)
+            if drive_size == local_size:
                 return item.get("id")
         except (TypeError, ValueError):
             continue
