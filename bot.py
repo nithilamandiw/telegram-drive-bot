@@ -689,7 +689,7 @@ def get_file_md5(file_path: str) -> str:
     return hash_md5.hexdigest()
 
 
-async def check_duplicate(service, file_path: str, filename: str, file_size: int | None):
+def check_duplicate(drive, file_path: str, filename: str, file_size: int | None):
     if not file_path or not filename or not file_size:
         return None
 
@@ -701,52 +701,35 @@ async def check_duplicate(service, file_path: str, filename: str, file_size: int
     if local_size <= 0:
         return None
 
-    normalized_name = (filename or "").strip().lower()
-    local_md5 = None
-    try:
-        local_md5 = await asyncio.to_thread(get_file_md5, file_path)
-    except Exception as e:
-        logger.warning(f"Could not compute local MD5 for duplicate check: {e}")
+    local_md5 = get_file_md5(file_path)
+    normalized_name = (filename or "").strip()
+    print("LOCAL:", filename, local_size, local_md5)
 
-    if local_md5:
-        logger.debug(f"LOCAL MD5: {local_md5}")
+    file_list = drive.ListFile({
+        "q": f"'{DRIVE_FOLDER_ID}' in parents and trashed=false"
+    }).GetList()
 
-    page_token = None
-    while True:
-        result = await asyncio.to_thread(
-            service.files().list(
-                q=f"'{DRIVE_FOLDER_ID}' in parents and trashed=false",
-                fields="nextPageToken,files(id,name,size,md5Checksum)",
-                pageSize=1000,
-                pageToken=page_token
-            ).execute
-        )
+    for item in file_list:
+        drive_name = item.get("title") or item.get("name") or ""
+        drive_md5 = item.get("md5Checksum")
 
-        for item in result.get("files", []):
-            logger.debug(f"CHECKING: {item.get('name')} {item.get('md5Checksum')}")
-
-            # Primary match: exact checksum match.
-            drive_md5 = item.get("md5Checksum")
-            if local_md5 and drive_md5 and drive_md5 == local_md5:
-                return item.get("id")
-
-            # Fallback match when checksum is unavailable: exact name + exact size.
-            size_raw = item.get("size")
-            if size_raw is None:
-                continue
-
+        size_raw = item.get("fileSize") or item.get("size")
+        drive_size = 0
+        if size_raw is not None:
             try:
                 drive_size = int(size_raw)
             except (TypeError, ValueError):
-                continue
+                drive_size = 0
 
-            drive_name = (item.get("name") or "").strip().lower()
-            if drive_size == local_size and drive_name == normalized_name:
-                return item.get("id")
+        print("CHECKING:", drive_name, drive_size, drive_md5)
 
-        page_token = result.get("nextPageToken")
-        if not page_token:
-            break
+        # Primary match: exact checksum match.
+        if drive_md5 and drive_md5 == local_md5:
+            return item.get("id")
+
+        # Fallback match: exact name + exact size.
+        if drive_size > 0 and drive_name == normalized_name and drive_size == local_size:
+            return item.get("id")
 
     return None
 
@@ -2415,9 +2398,7 @@ async def run_transfer_pipeline(
 
     # Duplicate detection before upload: MD5 first, then name+size fallback.
     try:
-        http = drive.auth.Get_Http_Object()
-        service = build("drive", "v3", http=http, cache_discovery=False)
-        existing_id = await check_duplicate(service, local_path, filename, known_size)
+        existing_id = await asyncio.to_thread(check_duplicate, drive, local_path, filename, known_size)
     except Exception as e:
         logger.warning(f"Duplicate check failed, continuing upload: {e}")
         existing_id = None
