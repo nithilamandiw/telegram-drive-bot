@@ -681,7 +681,7 @@ async def send_uploaded_ui(
 
 
 async def check_duplicate(service, filename: str, file_size: int | None):
-    if not filename or file_size is None:
+    if not filename or not file_size:
         return None
 
     try:
@@ -692,9 +692,14 @@ async def check_duplicate(service, filename: str, file_size: int | None):
     if local_size <= 0:
         return None
 
-    normalized_name = (filename or "").strip()
+    base_name = (filename or "").lower().strip()
+    # Use stem for a broader Drive query; final decision still uses size+name checks.
+    name_stem = os.path.splitext(base_name)[0].strip()
+    if not name_stem:
+        name_stem = base_name
+
     query = (
-        f"name contains '{escape_drive_query_value(normalized_name)}' and "
+        f"name contains '{escape_drive_query_value(name_stem)}' and "
         f"'{DRIVE_FOLDER_ID}' in parents and trashed=false"
     )
 
@@ -706,24 +711,29 @@ async def check_duplicate(service, filename: str, file_size: int | None):
         ).execute
     )
 
-    print("LOCAL:", normalized_name, local_size)
+    print("LOCAL:", filename, local_size)
 
     for item in result.get("files", []):
         print("DRIVE:", item.get("name"), item.get("size"))
-        drive_name = (item.get("name") or "").strip()
-        if drive_name != normalized_name:
-            continue
-
         size_raw = item.get("size")
         if size_raw is None:
             continue
 
         try:
             drive_size = int(size_raw)
-            if drive_size == local_size:
-                return item.get("id")
         except (TypeError, ValueError):
             continue
+
+        drive_name = (item.get("name") or "").lower().strip()
+        if not drive_name:
+            continue
+
+        size_tolerance = max(1, int(local_size * 0.01))
+        size_match = abs(drive_size - local_size) <= size_tolerance
+        name_match = name_stem in drive_name
+
+        if size_match and name_match:
+            return item.get("id")
 
     return None
 
