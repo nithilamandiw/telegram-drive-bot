@@ -221,33 +221,35 @@ def is_user(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
     return user_id in users
 
 
-def can_manage_files(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    return is_owner(user_id) or is_admin(user_id, context)
+def get_role(user_id: int, context: ContextTypes.DEFAULT_TYPE):
+    if is_owner(user_id):
+        return "owner"
+    if is_admin(user_id, context):
+        return "admin"
+    if is_user(user_id, context):
+        return "user"
+    return None
 
 
-def can_manage_users(user_id: int) -> bool:
-    return is_owner(user_id)
+def has_permission(user_id: int, context: ContextTypes.DEFAULT_TYPE, action: str) -> bool:
+    role = get_role(user_id, context)
+    permissions = {
+        "upload": ["owner", "admin", "user"],
+        "files": ["owner", "admin"],
+        "delete": ["owner", "admin"],
+        "rename": ["owner", "admin"],
+        "share": ["owner", "admin"],
+        "adduser": ["owner"],
+        "removeuser": ["owner"],
+        "addadmin": ["owner"],
+        "removeadmin": ["owner"],
+    }
+    return role in permissions.get(action, [])
 
 
 def is_allowed(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    if is_owner(user_id):
-        return True
-
-    admins = context.bot_data.get("admins", set())
-    users = context.bot_data.get("users", set())
-
-    if not isinstance(admins, set):
-        admins = set(admins or [])
-        context.bot_data["admins"] = admins
-    if not isinstance(users, set):
-        users = set(users or [])
-        context.bot_data["users"] = users
-
-    print("ADMINS:", admins)
-    print("USERS:", users)
-    print("CURRENT USER:", user_id)
-
-    return user_id in admins or user_id in users
+    # Backward-compatible helper: any recognized role can pass.
+    return has_permission(user_id, context, "upload")
 
 
 def default_analytics_data() -> dict:
@@ -965,7 +967,7 @@ async def storage(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     user = update.effective_user
 
-    if not user or not is_allowed(user.id, context):
+    if not user or not has_permission(user.id, context, "files"):
         await message.reply_text("❌ Unauthorized access")
         return
 
@@ -1009,7 +1011,7 @@ async def stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     user = update.effective_user
 
-    if not user or not is_allowed(user.id, context):
+    if not user or not has_permission(user.id, context, "files"):
         await message.reply_text("❌ Unauthorized access")
         return
 
@@ -1123,7 +1125,7 @@ async def get_file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     user = update.effective_user
 
-    if not user or not is_allowed(user.id, context):
+    if not user or not has_permission(user.id, context, "files"):
         await message.reply_text("❌ Unauthorized access")
         return
 
@@ -1226,7 +1228,7 @@ async def analytics_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     user = update.effective_user
 
-    if not user or not is_allowed(user.id, context):
+    if not user or not has_permission(user.id, context, "files"):
         await message.reply_text("❌ Unauthorized access")
         return
 
@@ -1258,7 +1260,7 @@ async def adduser_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
 
     user_id = user.id if user else 0
-    if not can_manage_users(user_id):
+    if not has_permission(user_id, context, "adduser"):
         await message.reply_text("❌ Only owner can use this command")
         return
 
@@ -1288,7 +1290,7 @@ async def remove_user_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     user = update.effective_user
 
     user_id = user.id if user else 0
-    if not can_manage_users(user_id):
+    if not has_permission(user_id, context, "removeuser"):
         await message.reply_text("❌ Only owner can use this command")
         return
 
@@ -1322,7 +1324,7 @@ async def add_admin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
 
     user_id = user.id if user else 0
-    if not can_manage_users(user_id):
+    if not has_permission(user_id, context, "addadmin"):
         await message.reply_text("❌ Only owner can use this command")
         return
 
@@ -1352,7 +1354,7 @@ async def remove_admin_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     user = update.effective_user
 
     user_id = user.id if user else 0
-    if not can_manage_users(user_id):
+    if not has_permission(user_id, context, "removeadmin"):
         await message.reply_text("❌ Only owner can use this command")
         return
 
@@ -1385,8 +1387,8 @@ async def files(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     user = update.effective_user
 
-    if not user or not is_allowed(user.id, context):
-        await message.reply_text("❌ Unauthorized access")
+    if not user or not has_permission(user.id, context, "files"):
+        await message.reply_text("❌ You don't have access to this command")
         return
 
     try:
@@ -1401,7 +1403,7 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     user = update.effective_user
 
-    if not user or not is_allowed(user.id, context):
+    if not user or not has_permission(user.id, context, "files"):
         await message.reply_text("❌ Unauthorized access")
         return
 
@@ -1722,7 +1724,7 @@ async def files_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
     query = update.callback_query
     user = update.effective_user
 
-    if not user or not is_allowed(user.id, context):
+    if not user or not has_permission(user.id, context, "upload"):
         await query.answer("Unauthorized", show_alert=True)
         return
 
@@ -1733,6 +1735,28 @@ async def files_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
             return
 
         action = payload.get("action")
+
+        if action in {"delete_from_files", "delete_from_search", "delete_upload"} and not has_permission(user.id, context, "delete"):
+            await query.answer("❌ Not allowed", show_alert=True)
+            return
+
+        if action == "rename" and not has_permission(user.id, context, "rename"):
+            await query.answer("❌ Not allowed", show_alert=True)
+            return
+
+        if action in {"public", "private", "expire_link"} and not has_permission(user.id, context, "share"):
+            await query.answer("❌ Not allowed", show_alert=True)
+            return
+
+        if action in {
+            "files_page",
+            "search_page",
+            "open_file_from_files",
+            "open_file_search_suggestion",
+            "open_file_from_search_results",
+        } and not has_permission(user.id, context, "files"):
+            await query.answer("❌ Not allowed", show_alert=True)
+            return
 
         if action == "files_page":
             page = int(payload.get("page", 1))
@@ -1914,7 +1938,7 @@ async def handle_rename_input(update: Update, context: ContextTypes.DEFAULT_TYPE
     message = update.message
     user = update.effective_user
 
-    if not user or not is_allowed(user.id, context):
+    if not user or not has_permission(user.id, context, "rename"):
         return
 
     file_id = context.user_data.get("rename_file_id")
@@ -1965,7 +1989,7 @@ async def cancel_transfer_callback(update: Update, context: ContextTypes.DEFAULT
     query = update.callback_query
     user = update.effective_user
 
-    if not user or not is_allowed(user.id, context):
+    if not user or not has_permission(user.id, context, "upload"):
         await query.answer("Unauthorized", show_alert=True)
         return
 
@@ -1988,7 +2012,7 @@ async def duplicate_upload_callback(update: Update, context: ContextTypes.DEFAUL
     query = update.callback_query
     user = update.effective_user
 
-    if not user or not is_allowed(user.id, context):
+    if not user or not has_permission(user.id, context, "upload"):
         await query.answer("Unauthorized", show_alert=True)
         return
 
@@ -2063,7 +2087,7 @@ async def pause_transfer_callback(update: Update, context: ContextTypes.DEFAULT_
     query = update.callback_query
     user = update.effective_user
 
-    if not user or not is_allowed(user.id, context):
+    if not user or not has_permission(user.id, context, "upload"):
         await query.answer("Unauthorized", show_alert=True)
         return
 
@@ -2097,7 +2121,7 @@ async def resume_transfer_callback(update: Update, context: ContextTypes.DEFAULT
     query = update.callback_query
     user = update.effective_user
 
-    if not user or not is_allowed(user.id, context):
+    if not user or not has_permission(user.id, context, "upload"):
         await query.answer("Unauthorized", show_alert=True)
         return
 
@@ -2427,7 +2451,7 @@ async def handle_url_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not url:
         return
 
-    if not user or not is_allowed(user.id, context):
+    if not user or not has_permission(user.id, context, "upload"):
         await message.reply_text("❌ Unauthorized access")
         return
 
@@ -2476,7 +2500,7 @@ async def handle_drive_link_message(update: Update, context: ContextTypes.DEFAUL
     if not url or not is_google_drive_link(url):
         return False
 
-    if not user or not is_allowed(user.id, context):
+    if not user or not has_permission(user.id, context, "upload"):
         await message.reply_text("❌ Unauthorized access")
         return True
 
@@ -2521,7 +2545,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Access control: only allow the owner to use file handlers.
     user = update.effective_user
-    if not user or not is_allowed(user.id, context):
+    if not user or not has_permission(user.id, context, "upload"):
         await message.reply_text("❌ Unauthorized access")
         return
 
