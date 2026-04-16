@@ -1345,6 +1345,35 @@ async def analytics_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await message.reply_text(text)
 
 
+async def adduser_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    user = update.effective_user
+
+    user_id = user.id if user else 0
+    if user_id != OWNER_ID:
+        await message.reply_text("❌ Only owner can use this command")
+        return
+
+    if not context.args:
+        await message.reply_text("Usage: /adduser <user_id>")
+        return
+
+    raw_target = (context.args[0] or "").strip()
+    if not raw_target.isdigit():
+        await message.reply_text("❌ Invalid user_id")
+        return
+
+    new_user_id = int(raw_target)
+    users_store = context.bot_data.get("users")
+    if not isinstance(users_store, set):
+        users_store = set(users_store or [])
+
+    users_store.add(new_user_id)
+    context.bot_data["users"] = users_store
+
+    await message.reply_text("✅ User added")
+
+
 async def files(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     user = update.effective_user
@@ -2719,6 +2748,7 @@ def main():
     app.add_handler(CommandHandler("storage", storage))
     app.add_handler(CommandHandler("stats", stats_handler))
     app.add_handler(CommandHandler("analytics", analytics_handler))
+    app.add_handler(CommandHandler("adduser", adduser_handler))
     app.add_handler(CommandHandler("get", get_file_handler))
     app.add_handler(CommandHandler("files", files))
     app.add_handler(CommandHandler("search", search))
