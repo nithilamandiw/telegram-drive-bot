@@ -102,6 +102,68 @@ def format_bytes_stats(num_bytes) -> str:
     return f"{mb:.2f} MB"
 
 
+async def notify(context: ContextTypes.DEFAULT_TYPE, text: str):
+    if not OWNER_ID:
+        return
+    try:
+        await context.bot.send_message(chat_id=OWNER_ID, text=text)
+    except Exception as e:
+        logger.warning(f"Notification send failed: {e}")
+
+
+async def get_drive_storage(context: ContextTypes.DEFAULT_TYPE):
+    drive = context.bot_data.get("drive")
+    if not drive:
+        return 0, 0
+
+    http = drive.auth.Get_Http_Object()
+    service = build("drive", "v3", http=http, cache_discovery=False)
+    about = await asyncio.to_thread(
+        service.about().get(fields="storageQuota").execute
+    )
+    quota = about.get("storageQuota", {})
+    used = int(quota.get("usage", 0) or 0)
+    total = int(quota.get("limit", 0) or 0)
+    return used, total
+
+
+async def check_expired_links(context: ContextTypes.DEFAULT_TYPE):
+    now = time.time()
+    exp_links = context.bot_data.setdefault("exp_links", {})
+
+    expired_ids = [file_id for file_id, expiry in list(exp_links.items()) if now >= float(expiry)]
+    for file_id in expired_ids:
+        await notify(context, f"⏰ Link expired for file: {file_id}")
+        exp_links.pop(file_id, None)
+
+
+async def check_storage(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        used, total = await get_drive_storage(context)
+    except Exception as e:
+        logger.warning(f"Storage check failed: {e}")
+        return
+
+    if total <= 0:
+        return
+
+    percent = (used / total) * 100
+    if percent < 90:
+        return
+
+    now = time.time()
+    last_alert = float(context.bot_data.get("last_storage_alert", 0) or 0)
+    if now - last_alert < 3600:
+        return
+
+    await notify(
+        context,
+        f"⚠️ Storage {percent:.0f}% full\n"
+        f"Used: {used / 1e9:.2f} GB / {total / 1e9:.2f} GB"
+    )
+    context.bot_data["last_storage_alert"] = now
+
+
 def default_analytics_data() -> dict:
     return {
         "total_uploads": 0,
@@ -1661,6 +1723,7 @@ async def files_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
 
             permission_id = await ensure_public_permission(service, file_id)
             asyncio.create_task(revoke_public_after_delay(context, file_id, permission_id, duration))
+            context.bot_data.setdefault("exp_links", {})[file_id] = time.time() + duration
 
             hours_label = "1 hour" if duration == 3600 else ("24 hours" if duration == 86400 else f"{duration}s")
             link = clean_drive_file_url(file_id)
@@ -2184,6 +2247,12 @@ async def run_transfer_pipeline(
             filename,
             message_to_edit=progress_msg,
         )
+        await notify(
+            context,
+            "✅ Upload Finished\n"
+            f"📄 {filename}\n"
+            f"📦 {known_size / (1024 * 1024):.2f} MB"
+        )
         try:
             update_upload_analytics(filename, known_size)
         except Exception as e:
@@ -2479,6 +2548,8 @@ def main():
 
     app.bot_data["drive"] = drive
     app.bot_data["upload_semaphore"] = asyncio.Semaphore(MAX_PARALLEL_UPLOADS)
+    app.bot_data.setdefault("exp_links", {})
+    app.bot_data.setdefault("last_storage_alert", 0.0)
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("storage", storage))
@@ -2496,6 +2567,12 @@ def main():
         filters.Document.ALL | filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE,
         handle_file
     ))
+
+    if app.job_queue:
+        app.job_queue.run_repeating(check_expired_links, interval=60, first=60)
+        app.job_queue.run_repeating(check_storage, interval=3600, first=120)
+    else:
+        logger.warning("Job queue unavailable; background notifications are disabled")
 
     logger.info(f"🤖 Bot is running... (parallel uploads: {MAX_PARALLEL_UPLOADS})")
     app.run_polling()
