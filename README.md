@@ -1,10 +1,19 @@
 # 🚀 Google Drive Bot
 
-A powerful Telegram bot to upload, manage, and share files directly with Google Drive — with advanced features like parallel uploads, file management UI, role-based access, and more.
+A powerful Telegram bot to upload, manage, and share files directly with Google Drive — with **per-user OAuth2 authentication**, parallel uploads, file management UI, role-based access, and more.
 
 ---
 
 ## ✨ Features
+
+### 🔐 Per-User Google OAuth2
+
+* Each user connects their **own Google account** via `/connect`
+* Credentials stored securely per user (`user_creds/{user_id}.json`)
+* Auto token refresh
+* `/disconnect` to revoke access
+
+---
 
 ### 📤 Upload System
 
@@ -22,7 +31,7 @@ A powerful Telegram bot to upload, manage, and share files directly with Google 
 
 ### ☁️ Google Drive Integration
 
-* Upload files to a specific folder
+* Upload files to user's own Google Drive
 * Generate shareable links
 * Clone Drive files (no re-upload needed)
 * Public / Private sharing
@@ -53,11 +62,7 @@ A powerful Telegram bot to upload, manage, and share files directly with Google 
 
 ### 🌐 URL Upload
 
-* Upload files from direct links
-
-```
-/url https://example.com/file.zip
-```
+* Upload files from direct links — just send a URL
 
 ---
 
@@ -109,40 +114,12 @@ Bot automatically detects:
 
 ---
 
-### 📊 Stats Dashboard
+### 📊 Stats & Analytics
 
-```
-/stats
-```
-
-* Total storage used
-* Free space
+* Storage usage and free space
 * File count
-
----
-
-### 📋 Commands List
-
-```
-/commands
-```
-
-* Dynamically shows commands based on role
-
----
-
-### 🗑 Trash System
-
-* Safe delete (move to trash)
-* Restore support
-
----
-
-### 🏷 Auto Tagging
-
-* .mp4 → Videos
-* .zip → Archives
-* .psd → Design
+* Upload/download history
+* Top file types
 
 ---
 
@@ -163,49 +140,54 @@ git clone https://github.com/nithilamandiw/telegram-drive-bot.git
 cd telegram-drive-bot
 ```
 
----
-
 ### 2. Create virtual environment
 
 ```bash
-python -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
-```
-
----
-
-### 3. Install dependencies
-
-```bash
 pip install -r requirements.txt
 ```
 
----
+### 3. Google Cloud Setup
+
+1. Go to [Google Cloud Console → APIs & Services → Credentials](https://console.cloud.google.com/apis/credentials)
+2. Create an **OAuth 2.0 Client ID** of type **Web application**
+3. Add your redirect URI under **Authorized redirect URIs**:
+   * Local testing: `http://localhost:8080/oauth/callback`
+   * Production: `https://your-domain.com/oauth/callback`
+4. Enable the **Google Drive API** in your project
+5. Download the client credentials JSON
 
 ### 4. Configure environment
 
-Create `.env` file:
+Copy `.env.example` to `.env` and fill in your values:
 
-```env
-TELEGRAM_TOKEN=your_bot_token
-DRIVE_FOLDER_ID=your_drive_folder_id
-OWNER_ID=your_telegram_id
+```bash
+cp .env.example .env
 ```
 
----
+| Variable | Description |
+|---|---|
+| `TELEGRAM_TOKEN` | Bot token from @BotFather |
+| `OWNER_ID` | Your Telegram user ID (full permissions) |
+| `GOOGLE_CLIENT_ID` | OAuth client ID from Google Cloud |
+| `GOOGLE_CLIENT_SECRET` | OAuth client secret from Google Cloud |
+| `OAUTH_REDIRECT_URI` | Callback URL (e.g. `http://localhost:8080/oauth/callback`) |
+| `OAUTH_SERVER_PORT` | Port for the OAuth callback server (default: `8080`) |
+| `USE_LOCAL_API` | Set to `true` to use local Telegram Bot API for large files |
+| `MAX_PARALLEL_UPLOADS` | Max concurrent uploads (default: `3`) |
 
-### 5. Google Drive Setup
+### 5. Run the bot
 
-* Enable Google Drive API
-* Download credentials
-* Configure `settings.yaml`
-* First run will authenticate
+```bash
+python bot.py
+```
 
 ---
 
 ## 🐳 Local Telegram API (for large files)
 
-Run:
+For files over 20MB, run the Telegram Bot API server locally via Docker:
 
 ```bash
 docker run -d -p 8081:8081 \
@@ -219,13 +201,28 @@ aiogram/telegram-bot-api \
 --temp-dir=/tmp/telegram-bot-api
 ```
 
+Then set `USE_LOCAL_API=true` in your `.env`.
+
 ---
 
-## ▶️ Run Bot
+## 📌 Commands
 
-```bash
-python bot.py
-```
+| Command | Description |
+| --- | --- |
+| `/start` | Welcome message |
+| `/connect` | Connect your Google Drive account |
+| `/disconnect` | Remove stored Google credentials |
+| `/commands` | Show available commands (role-based) |
+| `/files` | Browse your Drive files |
+| `/search <query>` | Search files by name |
+| `/get <name/id/link>` | Get a file from Drive |
+| `/storage` | View Drive storage usage |
+| `/stats` | View Drive stats |
+| `/analytics` | View upload/download analytics |
+| `/adduser <id>` | Add authorized user (owner only) |
+| `/removeuser <id>` | Remove user (owner only) |
+| `/addadmin <id>` | Add admin (owner only) |
+| `/removeadmin <id>` | Remove admin (owner only) |
 
 ---
 
@@ -238,13 +235,7 @@ tmux
 python bot.py
 ```
 
-Detach:
-
-```
-CTRL + B → D
-```
-
----
+Detach: `CTRL + B → D`
 
 ### Using systemd (Production)
 
@@ -255,46 +246,38 @@ sudo systemctl enable telegram-bot
 
 ---
 
-## 🚀 Auto Deploy (CI/CD)
-
-* Push to GitHub
-* Auto deploy to VPS
-* Auto restart bot
-
----
-
-## 📌 Commands
-
-| Command      | Description             |
-| ------------ | ----------------------- |
-| /commands    | Show available commands |
-| /files       | View files              |
-| /stats       | Storage info            |
-| /search      | Search files            |
-| /url         | Upload from URL         |
-| /get         | Download from Drive     |
-| /adduser     | Add user                |
-| /removeuser  | Remove user             |
-| /addadmin    | Add admin               |
-| /removeadmin | Remove admin            |
-
----
-
 ## 🧠 Tech Stack
 
-* Python (python-telegram-bot)
-* Google Drive API
+* Python (`python-telegram-bot`)
+* Google Auth + Google Drive API v3
+* aiohttp (OAuth callback server)
 * Docker (Local Bot API)
 * tmux / systemd
-* GitHub Actions (CI/CD)
+
+---
+
+## 📂 Project Structure
+
+```
+├── bot.py              # Main bot application
+├── requirements.txt    # Python dependencies
+├── .env                # Environment variables (not tracked)
+├── .env.example        # Environment template
+├── .gitignore          # Git ignore rules
+├── analytics.json      # Upload/download stats (auto-generated)
+├── allowed_users.json  # Authorized user list (auto-generated)
+├── admin_users.json    # Admin user list (auto-generated)
+└── user_creds/         # Per-user OAuth tokens (not tracked)
+```
 
 ---
 
 ## ⚠️ Notes
 
 * Only OWNER can manage users/admins
-* Local Bot API required for large files
-* Ensure proper permissions in Google Drive
+* Local Bot API required for files over 20MB
+* Each user must `/connect` before uploading
+* Credentials are stored locally — keep `user_creds/` secure
 
 ---
 
