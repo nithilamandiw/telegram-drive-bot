@@ -1,7 +1,14 @@
 {
-  "total_uploads": 0,
-  "total_downloads": 0,
-  "total_size": 0,
-  "daily": {},
-  "types": {}
+  "total_uploads": 1,
+  "total_downloads": 1,
+  "total_size": 6122085,
+  "daily": {
+    "2026-04-25": {
+      "uploads": 1,
+      "size": 6122085
+    }
+  },
+  "types": {
+    "psd": 1
+  }
 }
