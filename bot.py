@@ -880,6 +880,7 @@ async def upload_to_drive(
 
 
 async def download_via_local_api(
+    bot,
     file_id: str,
     local_path: str,
     file_size: int = 0,
@@ -887,21 +888,17 @@ async def download_via_local_api(
     should_cancel=None,
     task_state=None
 ) -> bool:
-    """Read file directly from the Docker volume on disk — no HTTP needed."""
+    """Download file using the bot's built-in local API support."""
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(
-                f"{LOCAL_API_URL}{TELEGRAM_TOKEN}/getFile",
-                json={"file_id": file_id}
-            )
-            data = resp.json()
+        # Use the bot's get_file which properly handles local mode
+        file_obj = await bot.get_file(file_id)
+        file_path = file_obj.file_path
 
-        if not data.get("ok"):
-            logger.warning(f"Local API getFile failed: {data}")
+        if not file_path:
+            logger.warning("Local API getFile returned no file_path")
             return False
 
-        file_path = data["result"]["file_path"]
-        # file_path is like: /var/lib/telegram-bot-api/1875002742:.../documents/file_3.psd
+        # In local mode, file_path is an absolute path inside the container
         # Remap it to the host volume path
         host_file_path = file_path.replace(LOCAL_API_DIR, VOLUME_HOST_PATH, 1)
         if task_state is not None:
@@ -912,8 +909,13 @@ async def download_via_local_api(
 
         fix_volume_permissions()
         if not os.path.exists(host_file_path):
-            logger.warning(f"File not found on host at: {host_file_path}")
-            return False
+            # If file not found at remapped path, use bot's download_to_drive
+            logger.info("File not at volume path, using bot download_to_drive...")
+            await file_obj.download_to_drive(local_path)
+            if progress_callback and file_size:
+                await progress_callback(file_size, file_size)
+            logger.info(f"Downloaded via download_to_drive: {local_path}")
+            return True
 
         downloaded = os.path.getsize(local_path) if os.path.exists(local_path) else 0
         if task_state is not None:
@@ -948,13 +950,13 @@ async def download_via_local_api(
 
         if progress_callback and file_size:
             await progress_callback(file_size, file_size)
-        logger.info(f"✅ Copied from volume: {local_path}")
+        logger.info(f"Copied from volume: {local_path}")
         return True
 
     except TransferCancelled:
         raise
     except Exception as e:
-        logger.warning(f"Local volume read failed: {e}")
+        logger.warning(f"Local download failed: {e}")
         return False
 
 
@@ -2700,6 +2702,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async def telegram_download_runner(local_path, known_size, progress_callback, should_cancel, task_state):
         try:
             downloaded = await download_via_local_api(
+                context.bot,
                 file_id,
                 local_path,
                 file_size=known_size,
