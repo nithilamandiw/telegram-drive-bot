@@ -61,18 +61,23 @@ def _build_oauth_client_config():
     }
 
 COMMANDS = {
-    "connect": ("🔗 /connect", "Connect your Google account"),
-    "disconnect": ("🔌 /disconnect", "Disconnect your Google account"),
-    "upload": ("📤 Send file", "Upload files to Drive"),
-    "files": ("📁 /files", "View Drive files"),
-    "stats": ("📊 /stats", "Storage stats"),
-    "url": ("🌐 /url <link>", "Upload from URL"),
-    "get": ("📥 /get <drive_link>", "Download from Drive"),
-    "search": ("🔍 /search <name>", "Search files"),
-    "adduser": ("➕ /adduser <id>", "Add user"),
-    "removeuser": ("➖ /removeuser <id>", "Remove user"),
-    "addadmin": ("👑 /addadmin <id>", "Add admin"),
-    "removeadmin": ("❌ /removeadmin <id>", "Remove admin"),
+    "connect": ("\U0001f517 /connect", "Connect your Google account"),
+    "disconnect": ("\U0001f50c /disconnect", "Disconnect your Google account"),
+    "upload": ("\U0001f4e4 Send file", "Upload files to Drive"),
+    "files": ("\U0001f4c1 /files", "View Drive files"),
+    "newfolder": ("\U0001f4c2 /newfolder <name>", "Create a new folder"),
+    "recent": ("\U0001f55b /recent", "View recently uploaded files"),
+    "search": ("\U0001f50d /search <name>", "Search files"),
+    "storage": ("\U0001f4be /storage", "View storage usage"),
+    "stats": ("\U0001f4ca /stats", "Storage stats"),
+    "analytics": ("\U0001f4c8 /analytics", "Upload/download analytics"),
+    "trash": ("\U0001f5d1 /trash", "View trash"),
+    "url": ("\U0001f310 /url <link>", "Upload from URL"),
+    "get": ("\U0001f4e5 /get <drive_link>", "Download from Drive"),
+    "adduser": ("\u2795 /adduser <id>", "Add user"),
+    "removeuser": ("\u2796 /removeuser <id>", "Remove user"),
+    "addadmin": ("\U0001f451 /addadmin <id>", "Add admin"),
+    "removeadmin": ("\u274c /removeadmin <id>", "Remove admin"),
 }
 
 COMMAND_PERMISSIONS = {
@@ -80,10 +85,15 @@ COMMAND_PERMISSIONS = {
     "disconnect": "upload",
     "upload": "upload",
     "files": "files",
-    "stats": "files",
+    "newfolder": "newfolder",
+    "recent": "recent",
+    "search": "search",
+    "storage": "storage",
+    "stats": "stats",
+    "analytics": "analytics",
+    "trash": "trash",
     "url": "upload",
     "get": "files",
-    "search": "files",
     "adduser": "adduser",
     "removeuser": "removeuser",
     "addadmin": "addadmin",
@@ -290,12 +300,19 @@ def has_permission(user_id: int, context: ContextTypes.DEFAULT_TYPE, action: str
     role = get_role(user_id, context)
     permissions = {
         "upload": ["owner", "admin", "user"],
-        "files": ["owner", "admin"],
-        "delete": ["owner", "admin"],
-        "rename": ["owner", "admin"],
-        "share": ["owner", "admin"],
-        "adduser": ["owner"],
-        "removeuser": ["owner"],
+        "files": ["owner", "admin", "user"],
+        "delete": ["owner", "admin", "user"],
+        "rename": ["owner", "admin", "user"],
+        "share": ["owner", "admin", "user"],
+        "search": ["owner", "admin", "user"],
+        "storage": ["owner", "admin", "user"],
+        "stats": ["owner", "admin", "user"],
+        "analytics": ["owner", "admin", "user"],
+        "newfolder": ["owner", "admin", "user"],
+        "recent": ["owner", "admin", "user"],
+        "trash": ["owner", "admin", "user"],
+        "adduser": ["owner", "admin"],
+        "removeuser": ["owner", "admin"],
         "addadmin": ["owner"],
         "removeadmin": ["owner"],
     }
@@ -834,6 +851,144 @@ async def handle_oauth_callback(request):
     except Exception as e:
         logger.error(f"OAuth callback failed for user {user_id}: {e}")
         return web.Response(text=f"Authorization failed: {e}", status=500)
+
+
+async def newfolder_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Create a new folder in the user's Google Drive."""
+    user = update.effective_user
+    if not user or not has_permission(user.id, context, "newfolder"):
+        await update.message.reply_text("\u274c Unauthorized access")
+        return
+
+    if not await require_connection(update, user.id):
+        return
+
+    if not context.args:
+        await update.message.reply_text("\u26a0\ufe0f Usage: /newfolder <name>")
+        return
+
+    folder_name = " ".join(context.args)
+    service = get_user_service(user.id)
+    if not service:
+        await update.message.reply_text("\u274c Could not connect to Google Drive. Try /connect again.")
+        return
+
+    try:
+        file_metadata = {
+            "name": folder_name,
+            "mimeType": "application/vnd.google-apps.folder",
+        }
+        folder = service.files().create(body=file_metadata, fields="id, name, webViewLink").execute()
+        link = folder.get("webViewLink", "")
+        await update.message.reply_text(
+            f"\u2705 Folder created!\n\n"
+            f"\U0001f4c2 {folder_name}\n"
+            f"\U0001f517 [Open folder]({link})",
+            parse_mode="Markdown",
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        logger.error(f"Failed to create folder for user {user.id}: {e}")
+        await update.message.reply_text(f"\u274c Failed to create folder: {e}")
+
+
+async def recent_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show recently uploaded files from the user's Google Drive."""
+    user = update.effective_user
+    if not user or not has_permission(user.id, context, "recent"):
+        await update.message.reply_text("\u274c Unauthorized access")
+        return
+
+    if not await require_connection(update, user.id):
+        return
+
+    service = get_user_service(user.id)
+    if not service:
+        await update.message.reply_text("\u274c Could not connect to Google Drive. Try /connect again.")
+        return
+
+    try:
+        results = service.files().list(
+            pageSize=10,
+            orderBy="createdTime desc",
+            q="trashed = false",
+            fields="files(id, name, size, mimeType, createdTime, webViewLink)",
+        ).execute()
+        files = results.get("files", [])
+
+        if not files:
+            await update.message.reply_text("\U0001f4ed No files found in your Drive.")
+            return
+
+        lines = ["\U0001f55b **Recent Files:**\n"]
+        for f in files:
+            name = f.get("name", "Unknown")
+            size = int(f.get("size", 0))
+            size_str = f"{size / (1024 * 1024):.2f} MB" if size > 0 else "---"
+            link = f.get("webViewLink", "")
+            lines.append(f"\U0001f4c4 [{name}]({link})")
+            lines.append(f"   {size_str}")
+            lines.append("")
+
+        await update.message.reply_text(
+            "\n".join(lines),
+            parse_mode="Markdown",
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        logger.error(f"Failed to get recent files for user {user.id}: {e}")
+        await update.message.reply_text(f"\u274c Failed to get recent files: {e}")
+
+
+async def trash_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show trashed files from the user's Google Drive."""
+    user = update.effective_user
+    if not user or not has_permission(user.id, context, "trash"):
+        await update.message.reply_text("\u274c Unauthorized access")
+        return
+
+    if not await require_connection(update, user.id):
+        return
+
+    service = get_user_service(user.id)
+    if not service:
+        await update.message.reply_text("\u274c Could not connect to Google Drive. Try /connect again.")
+        return
+
+    try:
+        results = service.files().list(
+            pageSize=15,
+            q="trashed = true",
+            fields="files(id, name, size, mimeType)",
+        ).execute()
+        files = results.get("files", [])
+
+        if not files:
+            await update.message.reply_text("\U0001f5d1 Trash is empty!")
+            return
+
+        lines = ["\U0001f5d1 **Trash:**\n"]
+        buttons = []
+        for f in files:
+            name = f.get("name", "Unknown")
+            size = int(f.get("size", 0))
+            size_str = f"{size / (1024 * 1024):.2f} MB" if size > 0 else "folder"
+            lines.append(f"\U0001f4c4 {name} ({size_str})")
+            buttons.append([
+                InlineKeyboardButton(f"\u267b\ufe0f Restore {name[:20]}", callback_data=f"cb_restore_{f['id']}"),
+                InlineKeyboardButton(f"\U0001f5d1 Delete {name[:20]}", callback_data=f"cb_permdelete_{f['id']}"),
+            ])
+
+        buttons.append([InlineKeyboardButton("\U0001f5d1 Empty Trash", callback_data="cb_emptytrash")])
+
+        await update.message.reply_text(
+            "\n".join(lines),
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+    except Exception as e:
+        logger.error(f"Failed to get trash for user {user.id}: {e}")
+        await update.message.reply_text(f"\u274c Failed to get trash: {e}")
 
 
 async def upload_to_drive(
@@ -1853,7 +2008,38 @@ async def files_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     try:
-        payload = resolve_callback_data(context, query.data or "")
+        raw_data = query.data or ""
+
+        # Handle trash callbacks (raw data, not stored)
+        if raw_data.startswith("cb_restore_"):
+            file_id = raw_data[len("cb_restore_"):]
+            service = get_user_service(user.id)
+            if service:
+                await asyncio.to_thread(
+                    service.files().update(fileId=file_id, body={"trashed": False}).execute
+                )
+                await query.answer("\u2705 File restored!")
+                await query.edit_message_text("\u2705 File restored from trash.")
+            return
+
+        if raw_data.startswith("cb_permdelete_"):
+            file_id = raw_data[len("cb_permdelete_"):]
+            service = get_user_service(user.id)
+            if service:
+                await asyncio.to_thread(service.files().delete(fileId=file_id).execute)
+                await query.answer("\u2705 Permanently deleted!")
+                await query.edit_message_text("\U0001f5d1 File permanently deleted.")
+            return
+
+        if raw_data == "cb_emptytrash":
+            service = get_user_service(user.id)
+            if service:
+                await asyncio.to_thread(service.files().emptyTrash().execute)
+                await query.answer("\u2705 Trash emptied!")
+                await query.edit_message_text("\U0001f5d1 Trash has been emptied.")
+            return
+
+        payload = resolve_callback_data(context, raw_data)
         if not payload:
             await query.answer("Action expired. Please try again.", show_alert=True)
             return
@@ -2793,6 +2979,9 @@ def main():
     app.add_handler(CommandHandler("get", get_file_handler))
     app.add_handler(CommandHandler("files", files))
     app.add_handler(CommandHandler("search", search))
+    app.add_handler(CommandHandler("newfolder", newfolder_handler))
+    app.add_handler(CommandHandler("recent", recent_handler))
+    app.add_handler(CommandHandler("trash", trash_handler))
     app.add_handler(CallbackQueryHandler(pause_transfer_callback, pattern=r"^pause_"))
     app.add_handler(CallbackQueryHandler(resume_transfer_callback, pattern=r"^resume_"))
     app.add_handler(CallbackQueryHandler(cancel_transfer_callback, pattern=r"^cancel_"))
