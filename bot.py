@@ -307,7 +307,7 @@ def has_permission(user_id: int, context: ContextTypes.DEFAULT_TYPE, action: str
         "search": ["owner", "admin", "user"],
         "storage": ["owner", "admin", "user"],
         "stats": ["owner", "admin", "user"],
-        "analytics": ["owner", "admin", "user"],
+        "analytics": ["owner", "admin"],
         "newfolder": ["owner", "admin", "user"],
         "recent": ["owner", "admin", "user"],
         "trash": ["owner", "admin", "user"],
@@ -1254,10 +1254,15 @@ async def build_main_menu(user_id: int, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("\U0001f4be Storage", callback_data="menu_storage"),
             InlineKeyboardButton("\U0001f4ca Stats", callback_data="menu_stats"),
         ])
-        buttons.append([
-            InlineKeyboardButton("\U0001f4c8 Analytics", callback_data="menu_analytics"),
-            InlineKeyboardButton("\U0001f5d1 Trash", callback_data="menu_trash"),
-        ])
+        if has_permission(user_id, context, "analytics"):
+            buttons.append([
+                InlineKeyboardButton("\U0001f4c8 Analytics", callback_data="menu_analytics"),
+                InlineKeyboardButton("\U0001f5d1 Trash", callback_data="menu_trash"),
+            ])
+        else:
+            buttons.append([
+                InlineKeyboardButton("\U0001f5d1 Trash", callback_data="menu_trash"),
+            ])
 
     # Admin section
     if has_permission(user_id, context, "adduser"):
