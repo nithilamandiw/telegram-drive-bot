@@ -1205,18 +1205,361 @@ async def download_via_cdn(
         return False
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 Hello! I'm your *Google Drive Upload Bot*.\n\n"
-        "Send me any file, photo, video, audio or voice message "
-        "and I'll upload it to your Google Drive! 🚀\n\n"
-        "🔗 Use /connect to link your Google account first.\n"
-        "✅ Supports files up to *2GB* via local API server.",
-        parse_mode="Markdown"
+async def build_main_menu(user_id: int, context: ContextTypes.DEFAULT_TYPE):
+    """Build the main menu keyboard based on user permissions."""
+    role = get_role(user_id, context)
+    if not role:
+        return None, None
+
+    # Check if user has Google connected
+    creds_path = get_user_creds_path(user_id)
+    connected = os.path.exists(creds_path)
+
+    greeting = (
+        "\U0001f44b *Welcome to Drive Upload Bot!*\n\n"
+        "Send me any file, photo, video or audio and\n"
+        "I'll upload it to your Google Drive.\n\n"
     )
+
+    if connected:
+        greeting += "\u2705 *Google Drive connected*\n"
+    else:
+        greeting += "\u26a0\ufe0f *Google Drive not connected*\n"
+
+    greeting += f"\U0001f464 Role: *{role.capitalize()}*"
+
+    buttons = []
+
+    # Row 1: Connect/Disconnect
+    if connected:
+        buttons.append([
+            InlineKeyboardButton("\U0001f50c Disconnect", callback_data="menu_disconnect"),
+        ])
+    else:
+        buttons.append([
+            InlineKeyboardButton("\U0001f517 Connect Google", callback_data="menu_connect"),
+        ])
+
+    # Row 2-3: File management (all connected users)
+    if connected:
+        buttons.append([
+            InlineKeyboardButton("\U0001f4c1 My Files", callback_data="menu_files"),
+            InlineKeyboardButton("\U0001f55b Recent", callback_data="menu_recent"),
+        ])
+        buttons.append([
+            InlineKeyboardButton("\U0001f50d Search", callback_data="menu_search"),
+            InlineKeyboardButton("\U0001f4c2 New Folder", callback_data="menu_newfolder"),
+        ])
+        buttons.append([
+            InlineKeyboardButton("\U0001f4be Storage", callback_data="menu_storage"),
+            InlineKeyboardButton("\U0001f4ca Stats", callback_data="menu_stats"),
+        ])
+        buttons.append([
+            InlineKeyboardButton("\U0001f4c8 Analytics", callback_data="menu_analytics"),
+            InlineKeyboardButton("\U0001f5d1 Trash", callback_data="menu_trash"),
+        ])
+
+    # Admin section
+    if has_permission(user_id, context, "adduser"):
+        buttons.append([
+            InlineKeyboardButton("\u2795 Add User", callback_data="menu_adduser"),
+            InlineKeyboardButton("\u2796 Remove User", callback_data="menu_removeuser"),
+        ])
+
+    if has_permission(user_id, context, "addadmin"):
+        buttons.append([
+            InlineKeyboardButton("\U0001f451 Add Admin", callback_data="menu_addadmin"),
+            InlineKeyboardButton("\u274c Remove Admin", callback_data="menu_removeadmin"),
+        ])
+
+    keyboard = InlineKeyboardMarkup(buttons)
+    return greeting, keyboard
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user:
+        return
+
+    role = get_role(user.id, context)
+    if not role:
+        await update.message.reply_text(
+            "\u274c You don't have access to this bot.\n"
+            "Ask the bot owner to add you with /adduser."
+        )
+        return
+
+    text, keyboard = await build_main_menu(user.id, context)
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
+
+
+async def main_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle main menu button presses."""
+    query = update.callback_query
+    user = update.effective_user
+
+    if not user:
+        return
+
+    role = get_role(user.id, context)
+    if not role:
+        await query.answer("Unauthorized", show_alert=True)
+        return
+
+    action = (query.data or "").replace("menu_", "")
+    await query.answer()
+
+    if action == "connect":
+        # Trigger connect flow
+        flow = InstalledAppFlow.from_client_config(
+            {
+                "installed": {
+                    "client_id": GOOGLE_CLIENT_ID,
+                    "client_secret": GOOGLE_CLIENT_SECRET,
+                    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                    "token_uri": "https://oauth2.googleapis.com/token",
+                    "redirect_uris": [OAUTH_REDIRECT_URI],
+                }
+            },
+            scopes=SCOPES,
+        )
+        auth_url, _ = flow.authorization_url(
+            access_type="offline",
+            prompt="consent",
+            redirect_uri=OAUTH_REDIRECT_URI,
+            state=str(user.id),
+        )
+        await query.edit_message_text(
+            "\U0001f517 Click the link below to connect your Google Drive:\n\n"
+            f"[Authorize Google Drive]({auth_url})\n\n"
+            "After authorizing, send /start to return to the menu.",
+            parse_mode="Markdown",
+            disable_web_page_preview=True,
+        )
+        return
+
+    if action == "disconnect":
+        creds_path = get_user_creds_path(user.id)
+        if os.path.exists(creds_path):
+            os.remove(creds_path)
+        text, keyboard = await build_main_menu(user.id, context)
+        await query.edit_message_text(
+            "\u2705 Google account disconnected.\n\n" + text,
+            parse_mode="Markdown",
+            reply_markup=keyboard,
+        )
+        return
+
+    if action == "back":
+        text, keyboard = await build_main_menu(user.id, context)
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+        return
+
+    if action == "files":
+        if not await require_connection(update, user.id):
+            return
+        context.user_data["_oauth_user_id"] = user.id
+        text, keyboard = await build_files_page(context, user.id, page=1, page_size=10)
+        back_btn = [InlineKeyboardButton("\u25c0\ufe0f Back to Menu", callback_data="menu_back")]
+        if keyboard:
+            rows = list(keyboard.inline_keyboard) + [back_btn]
+            keyboard = InlineKeyboardMarkup(rows)
+        else:
+            keyboard = InlineKeyboardMarkup([back_btn])
+        await query.edit_message_text(text=text, reply_markup=keyboard)
+        return
+
+    if action == "recent":
+        if not await require_connection(update, user.id):
+            return
+        service = get_user_service(user.id)
+        if not service:
+            await query.edit_message_text("\u274c Drive connection error. Try /connect.")
+            return
+        try:
+            results = service.files().list(
+                pageSize=10, orderBy="createdTime desc", q="trashed = false",
+                fields="files(id, name, size, mimeType, createdTime, webViewLink)",
+            ).execute()
+            files_list = results.get("files", [])
+            if not files_list:
+                text = "\U0001f4ed No files found."
+            else:
+                lines = ["\U0001f55b *Recent Files:*\n"]
+                for f in files_list:
+                    name = f.get("name", "Unknown")
+                    size = int(f.get("size", 0))
+                    size_str = f"{size / (1024 * 1024):.2f} MB" if size > 0 else "---"
+                    link = f.get("webViewLink", "")
+                    lines.append(f"\U0001f4c4 [{name}]({link})")
+                    lines.append(f"   {size_str}")
+                    lines.append("")
+                text = "\n".join(lines)
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("\u25c0\ufe0f Back to Menu", callback_data="menu_back")
+            ]])
+            await query.edit_message_text(text, parse_mode="Markdown",
+                                          disable_web_page_preview=True, reply_markup=keyboard)
+        except Exception as e:
+            await query.edit_message_text(f"\u274c Error: {e}")
+        return
+
+    if action == "search":
+        await query.edit_message_text(
+            "\U0001f50d *Search Files*\n\n"
+            "Type your search query using:\n"
+            "`/search filename`\n\n"
+            "Then press /start to return to the menu.",
+            parse_mode="Markdown",
+        )
+        return
+
+    if action == "newfolder":
+        await query.edit_message_text(
+            "\U0001f4c2 *Create Folder*\n\n"
+            "Type the folder name using:\n"
+            "`/newfolder My Folder Name`\n\n"
+            "Then press /start to return to the menu.",
+            parse_mode="Markdown",
+        )
+        return
+
+    if action == "storage":
+        if not await require_connection(update, user.id):
+            return
+        service = get_user_service(user.id)
+        if not service:
+            await query.edit_message_text("\u274c Drive connection error.")
+            return
+        try:
+            about = await asyncio.to_thread(service.about().get(fields="storageQuota").execute)
+            quota = about.get("storageQuota", {})
+            total = int(quota.get("limit", 0))
+            used = int(quota.get("usage", 0))
+            free = max(total - used, 0) if total else 0
+            to_gb = lambda b: b / (1024 ** 3)
+            if total > 0:
+                pct = (used / total) * 100
+                bar_len = 20
+                filled = int(bar_len * used / total)
+                bar = "\u2588" * filled + "\u2591" * (bar_len - filled)
+                text = (
+                    "\U0001f4be *Google Drive Storage*\n\n"
+                    f"Used: `{to_gb(used):.2f} GB` / `{to_gb(total):.2f} GB`\n"
+                    f"Free: `{to_gb(free):.2f} GB`\n\n"
+                    f"`[{bar}]` {pct:.1f}%"
+                )
+            else:
+                text = f"\U0001f4be *Storage*\n\nUsed: `{to_gb(used):.2f} GB`"
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("\u25c0\ufe0f Back to Menu", callback_data="menu_back")
+            ]])
+            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+        except Exception as e:
+            await query.edit_message_text(f"\u274c Error: {e}")
+        return
+
+    if action == "stats":
+        if not await require_connection(update, user.id):
+            return
+        service = get_user_service(user.id)
+        if not service:
+            await query.edit_message_text("\u274c Drive connection error.")
+            return
+        try:
+            results = service.files().list(
+                q="trashed = false", pageSize=1000,
+                fields="files(size, mimeType)",
+            ).execute()
+            files_list = results.get("files", [])
+            total_files = len(files_list)
+            total_size = sum(int(f.get("size", 0)) for f in files_list)
+            types = {}
+            for f in files_list:
+                mt = f.get("mimeType", "unknown").split("/")[0]
+                types[mt] = types.get(mt, 0) + 1
+            lines = [
+                "\U0001f4ca *Drive Stats*\n",
+                f"Total files: *{total_files}*",
+                f"Total size: *{total_size / (1024**3):.2f} GB*\n",
+                "*By type:*",
+            ]
+            for t, c in sorted(types.items(), key=lambda x: -x[1]):
+                lines.append(f"  {t}: {c}")
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("\u25c0\ufe0f Back to Menu", callback_data="menu_back")
+            ]])
+            await query.edit_message_text("\n".join(lines), parse_mode="Markdown", reply_markup=keyboard)
+        except Exception as e:
+            await query.edit_message_text(f"\u274c Error: {e}")
+        return
+
+    if action == "analytics":
+        analytics = load_analytics()
+        text = (
+            "\U0001f4c8 *Analytics*\n\n"
+            f"Total uploads: *{analytics.get('total_uploads', 0)}*\n"
+            f"Total downloads: *{analytics.get('total_downloads', 0)}*\n"
+            f"Total data: *{analytics.get('total_size', 0) / (1024**3):.2f} GB*"
+        )
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("\u25c0\ufe0f Back to Menu", callback_data="menu_back")
+        ]])
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+        return
+
+    if action == "trash":
+        if not await require_connection(update, user.id):
+            return
+        service = get_user_service(user.id)
+        if not service:
+            await query.edit_message_text("\u274c Drive connection error.")
+            return
+        try:
+            results = service.files().list(
+                pageSize=15, q="trashed = true",
+                fields="files(id, name, size, mimeType)",
+            ).execute()
+            files_list = results.get("files", [])
+            if not files_list:
+                text = "\U0001f5d1 Trash is empty!"
+                keyboard = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("\u25c0\ufe0f Back to Menu", callback_data="menu_back")
+                ]])
+            else:
+                lines = ["\U0001f5d1 *Trash:*\n"]
+                btns = []
+                for f in files_list:
+                    name = f.get("name", "Unknown")
+                    size = int(f.get("size", 0))
+                    size_str = f"{size / (1024 * 1024):.2f} MB" if size > 0 else "folder"
+                    lines.append(f"\U0001f4c4 {name} ({size_str})")
+                    btns.append([
+                        InlineKeyboardButton(f"\u267b\ufe0f {name[:18]}", callback_data=f"cb_restore_{f['id']}"),
+                        InlineKeyboardButton(f"\U0001f5d1 {name[:18]}", callback_data=f"cb_permdelete_{f['id']}"),
+                    ])
+                btns.append([InlineKeyboardButton("\U0001f5d1 Empty Trash", callback_data="cb_emptytrash")])
+                btns.append([InlineKeyboardButton("\u25c0\ufe0f Back to Menu", callback_data="menu_back")])
+                text = "\n".join(lines)
+                keyboard = InlineKeyboardMarkup(btns)
+            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+        except Exception as e:
+            await query.edit_message_text(f"\u274c Error: {e}")
+        return
+
+    if action in ("adduser", "removeuser", "addadmin", "removeadmin"):
+        cmd = f"/{action}"
+        await query.edit_message_text(
+            f"\u2699\ufe0f *{action.replace('add', 'Add ').replace('remove', 'Remove ').title()}*\n\n"
+            f"Use: `{cmd} <telegram_user_id>`\n\n"
+            "Then press /start to return to the menu.",
+            parse_mode="Markdown",
+        )
+        return
 
 
 async def commands_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Fallback text command list."""
     message = update.message
     user = update.effective_user
 
@@ -1226,18 +1569,19 @@ async def commands_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = user.id
     role = get_role(user_id, context)
     if not role:
-        await message.reply_text("❌ Unauthorized access")
+        await message.reply_text("\u274c Unauthorized access")
         return
 
-    lines = ["📋 Available Commands:", ""]
+    lines = ["\U0001f4cb Available Commands:", ""]
     for key, (cmd, desc) in COMMANDS.items():
         action = COMMAND_PERMISSIONS.get(key)
         if action and has_permission(user_id, context, action):
             lines.append(cmd)
-            lines.append(f"   └ {desc}")
+            lines.append(f"   \u2514 {desc}")
             lines.append("")
 
-    lines.append(f"👤 Role: {role.capitalize()}")
+    lines.append(f"\U0001f464 Role: {role.capitalize()}")
+    lines.append("\nTip: Use /start for the button menu!")
     await message.reply_text("\n".join(lines))
 
 
@@ -2982,6 +3326,7 @@ def main():
     app.add_handler(CommandHandler("newfolder", newfolder_handler))
     app.add_handler(CommandHandler("recent", recent_handler))
     app.add_handler(CommandHandler("trash", trash_handler))
+    app.add_handler(CallbackQueryHandler(main_menu_callback, pattern=r"^menu_"))
     app.add_handler(CallbackQueryHandler(pause_transfer_callback, pattern=r"^pause_"))
     app.add_handler(CallbackQueryHandler(resume_transfer_callback, pattern=r"^resume_"))
     app.add_handler(CallbackQueryHandler(cancel_transfer_callback, pattern=r"^cancel_"))
