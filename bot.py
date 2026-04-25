@@ -34,6 +34,7 @@ OAUTH_SERVER_PORT = int(os.getenv("OAUTH_SERVER_PORT", "8080"))
 # Local Bot API server (optional — for large file support via Docker)
 USE_LOCAL_API = os.getenv("USE_LOCAL_API", "false").lower() in ("true", "1", "yes")
 LOCAL_API_URL = "http://localhost:8081/bot"
+LOCAL_FILE_URL = "http://localhost:8081/file/bot"
 LOCAL_API_DIR = "/var/lib/telegram-bot-api"  # path inside container
 VOLUME_HOST_PATH = "/home/azureuser/telegram-api-data"
 MAX_PARALLEL_UPLOADS = int(os.getenv("MAX_PARALLEL_UPLOADS", "3"))
@@ -2762,7 +2763,7 @@ def main():
 
     builder = ApplicationBuilder().token(TELEGRAM_TOKEN).concurrent_updates(True)
     if USE_LOCAL_API:
-        builder = builder.base_url(LOCAL_API_URL).local_mode(True)
+        builder = builder.base_url(LOCAL_API_URL).base_file_url(LOCAL_FILE_URL).local_mode(True)
         logger.info("Using local Telegram Bot API server")
     else:
         logger.info("Using standard Telegram API")
