@@ -45,7 +45,7 @@ USER_CREDS_DIR = "user_creds"
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 URL_PATTERN = re.compile(r"(https?://\S+)", re.IGNORECASE)
 DRIVE_FILE_ID_PATTERN = re.compile(r"(?:/d/|id=)([a-zA-Z0-9_-]+)")
-MAX_URL_DOWNLOAD_SIZE = int(os.getenv("MAX_URL_DOWNLOAD_SIZE", str(2 * 1024 * 1024 * 1024)))
+MAX_URL_DOWNLOAD_SIZE = int(os.getenv("MAX_URL_DOWNLOAD_SIZE", "0"))  # 0 = unlimited
 DOWNLOADS_DIR = "./downloads"
 
 
