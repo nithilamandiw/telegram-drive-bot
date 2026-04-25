@@ -2,6 +2,7 @@
 .env
 client_secrets.json
 saved_creds.json
+user_creds/
 
 # Python
 __pycache__/
@@ -11,6 +12,7 @@ __pycache__/
 .Python
 env/
 venv/
+.venv/
 *.egg-info/
 dist/
 build/

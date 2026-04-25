@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import json
 import re
@@ -11,20 +13,26 @@ import requests
 from datetime import datetime
 from urllib.parse import urlparse, unquote
 from dotenv import load_dotenv
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request as GoogleAuthRequest
+from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from googleapiclient.http import MediaIoBaseDownload
+from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, CallbackQueryHandler, filters, ContextTypes
-from pydrive2.auth import GoogleAuth
-from pydrive2.drive import GoogleDrive
+from aiohttp import web
 
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-DRIVE_FOLDER_ID = (os.getenv("DRIVE_FOLDER_ID") or "").strip()
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
+OAUTH_REDIRECT_URI = os.getenv("OAUTH_REDIRECT_URI", "")
+OAUTH_SERVER_PORT = int(os.getenv("OAUTH_SERVER_PORT", "8080"))
 
-# Local Bot API server URL (running via Docker)
+# Local Bot API server (optional — for large file support via Docker)
+USE_LOCAL_API = os.getenv("USE_LOCAL_API", "false").lower() in ("true", "1", "yes")
 LOCAL_API_URL = "http://localhost:8081/bot"
 LOCAL_API_DIR = "/var/lib/telegram-bot-api"  # path inside container
 VOLUME_HOST_PATH = "/home/azureuser/telegram-api-data"
@@ -32,12 +40,28 @@ MAX_PARALLEL_UPLOADS = int(os.getenv("MAX_PARALLEL_UPLOADS", "3"))
 ANALYTICS_FILE = "analytics.json"
 USERS_FILE = "users.json"
 ADMINS_FILE = "admins.json"
+USER_CREDS_DIR = "user_creds"
+SCOPES = ["https://www.googleapis.com/auth/drive"]
 URL_PATTERN = re.compile(r"(https?://\S+)", re.IGNORECASE)
 DRIVE_FILE_ID_PATTERN = re.compile(r"(?:/d/|id=)([a-zA-Z0-9_-]+)")
 MAX_URL_DOWNLOAD_SIZE = int(os.getenv("MAX_URL_DOWNLOAD_SIZE", str(2 * 1024 * 1024 * 1024)))
 DOWNLOADS_DIR = "./downloads"
 
+
+def _build_oauth_client_config():
+    return {
+        "web": {
+            "client_id": GOOGLE_CLIENT_ID,
+            "client_secret": GOOGLE_CLIENT_SECRET,
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "redirect_uris": [OAUTH_REDIRECT_URI],
+        }
+    }
+
 COMMANDS = {
+    "connect": ("🔗 /connect", "Connect your Google account"),
+    "disconnect": ("🔌 /disconnect", "Disconnect your Google account"),
     "upload": ("📤 Send file", "Upload files to Drive"),
     "files": ("📁 /files", "View Drive files"),
     "stats": ("📊 /stats", "Storage stats"),
@@ -51,6 +75,8 @@ COMMANDS = {
 }
 
 COMMAND_PERMISSIONS = {
+    "connect": "upload",
+    "disconnect": "upload",
     "upload": "upload",
     "files": "files",
     "stats": "files",
@@ -136,13 +162,12 @@ async def notify(context: ContextTypes.DEFAULT_TYPE, text: str):
         logger.warning(f"Notification send failed: {e}")
 
 
-async def get_drive_storage(context: ContextTypes.DEFAULT_TYPE):
-    drive = context.bot_data.get("drive")
-    if not drive:
+async def get_drive_storage(user_id: int):
+    try:
+        service = get_user_service(user_id)
+    except Exception:
         return 0, 0
 
-    http = drive.auth.Get_Http_Object()
-    service = build("drive", "v3", http=http, cache_discovery=False)
     about = await asyncio.to_thread(
         service.about().get(fields="storageQuota").execute
     )
@@ -163,8 +188,11 @@ async def check_expired_links(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def check_storage(context: ContextTypes.DEFAULT_TYPE):
+    # Check storage for the owner if connected
+    if not OWNER_ID or not user_has_credentials(OWNER_ID):
+        return
     try:
-        used, total = await get_drive_storage(context)
+        used, total = await get_drive_storage(OWNER_ID)
     except Exception as e:
         logger.warning(f"Storage check failed: {e}")
         return
@@ -377,10 +405,8 @@ def is_google_drive_link(url: str) -> bool:
     return "drive.google.com" in netloc
 
 
-async def clone_drive_file(context: ContextTypes.DEFAULT_TYPE, source_file_id: str):
-    drive = context.bot_data.get("drive")
-    http = drive.auth.Get_Http_Object()
-    service = build("drive", "v3", http=http, cache_discovery=False)
+async def clone_drive_file(user_id: int, source_file_id: str):
+    service = get_user_service(user_id)
 
     original = await asyncio.to_thread(
         service.files().get(fileId=source_file_id, fields="id,name").execute
@@ -390,10 +416,7 @@ async def clone_drive_file(context: ContextTypes.DEFAULT_TYPE, source_file_id: s
     copied = await asyncio.to_thread(
         service.files().copy(
             fileId=source_file_id,
-            body={
-                "name": original_name,
-                "parents": [DRIVE_FOLDER_ID]
-            },
+            body={"name": original_name},
             fields="id,name"
         ).execute
     )
@@ -563,14 +586,12 @@ async def ensure_public_permission(service, file_id: str) -> str:
     return created["id"]
 
 
-async def revoke_public_after_delay(context: ContextTypes.DEFAULT_TYPE, file_id: str, permission_id: str, delay_seconds: int):
+async def revoke_public_after_delay(context: ContextTypes.DEFAULT_TYPE, user_id: int, file_id: str, permission_id: str, delay_seconds: int):
     try:
         await asyncio.sleep(delay_seconds)
-        drive = context.bot_data.get("drive")
-        if not drive:
+        if not user_has_credentials(user_id):
             return
-        http = drive.auth.Get_Http_Object()
-        service = build("drive", "v3", http=http, cache_discovery=False)
+        service = get_user_service(user_id)
         await asyncio.to_thread(
             service.permissions().delete(
                 fileId=file_id,
@@ -606,13 +627,12 @@ async def build_upload_action_keyboard(context: ContextTypes.DEFAULT_TYPE, servi
 async def send_uploaded_ui(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
     file_id: str,
     filename: str,
     message_to_edit=None,
 ):
-    drive = context.bot_data.get("drive")
-    http = drive.auth.Get_Http_Object()
-    service = build("drive", "v3", http=http, cache_discovery=False)
+    service = get_user_service(user_id)
 
     # Keep link generation centralized for all uploaded/cloned success UI.
     _ = clean_drive_file_url(file_id)
@@ -642,7 +662,7 @@ async def check_duplicate(service, filename: str, file_size: int | None):
     normalized_name = (filename or "").strip()
     query = (
         f"name contains '{escape_drive_query_value(normalized_name)}' and "
-        f"'{DRIVE_FOLDER_ID}' in parents and trashed=false"
+        f"trashed=false"
     )
 
     result = await asyncio.to_thread(
@@ -653,10 +673,7 @@ async def check_duplicate(service, filename: str, file_size: int | None):
         ).execute
     )
 
-    print("LOCAL:", normalized_name, local_size)
-
     for item in result.get("files", []):
-        print("DRIVE:", item.get("name"), item.get("size"))
         drive_name = (item.get("name") or "").strip()
         if drive_name != normalized_name:
             continue
@@ -694,22 +711,132 @@ def fix_volume_permissions():
         logger.warning(f"Could not fix volume permissions: {e}")
 
 
-def get_drive():
-    gauth = GoogleAuth(settings_file="settings.yaml")
-    gauth.LoadCredentialsFile("saved_creds.json")
-    if gauth.credentials is None:
-        gauth.LocalWebserverAuth()
-    elif gauth.access_token_expired:
-        gauth.Refresh()
+def get_user_creds_path(user_id: int) -> str:
+    return os.path.join(USER_CREDS_DIR, f"{user_id}.json")
+
+
+def user_has_credentials(user_id: int) -> bool:
+    return os.path.exists(get_user_creds_path(user_id))
+
+
+def get_user_service(user_id: int):
+    creds_path = get_user_creds_path(user_id)
+    if not os.path.exists(creds_path):
+        raise RuntimeError("Google account not connected. Use /connect to get started.")
+
+    creds = Credentials.from_authorized_user_file(creds_path, SCOPES)
+    if creds.expired and creds.refresh_token:
+        creds.refresh(GoogleAuthRequest())
+        with open(creds_path, "w", encoding="utf-8") as f:
+            f.write(creds.to_json())
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+
+async def require_connection(update: Update, user_id: int) -> bool:
+    """Returns True if user is connected. Sends error message and returns False otherwise."""
+    if user_has_credentials(user_id):
+        return True
+    msg = update.message if update.message else (update.callback_query.message if update.callback_query else None)
+    if msg:
+        await msg.reply_text("\u274c You haven't connected your Google account yet. Use /connect to get started.")
+    return False
+
+
+async def connect_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user:
+        return
+
+    if not is_allowed(user.id, context):
+        await update.message.reply_text("\u274c Unauthorized access")
+        return
+
+    flow = Flow.from_client_config(
+        _build_oauth_client_config(),
+        scopes=SCOPES,
+        redirect_uri=OAUTH_REDIRECT_URI,
+    )
+    auth_url, _ = flow.authorization_url(
+        access_type="offline",
+        prompt="consent",
+        state=str(user.id),
+    )
+
+    await update.message.reply_text(
+        "Click the link below to connect your Google Drive:\n\n"
+        f"[Authorize Google Drive]({auth_url})\n\n"
+        "After authorizing, you'll receive a confirmation message here.",
+        parse_mode="Markdown",
+        disable_web_page_preview=True,
+    )
+
+
+async def disconnect_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user:
+        return
+
+    if not is_allowed(user.id, context):
+        await update.message.reply_text("\u274c Unauthorized access")
+        return
+
+    creds_path = get_user_creds_path(user.id)
+    if os.path.exists(creds_path):
+        os.remove(creds_path)
+        await update.message.reply_text("\u2705 Google account disconnected successfully.")
     else:
-        gauth.Authorize()
-    gauth.SaveCredentialsFile("saved_creds.json")
-    return GoogleDrive(gauth)
+        await update.message.reply_text("\u26a0\ufe0f No Google account is connected.")
+
+
+async def handle_oauth_callback(request):
+    code = request.query.get("code")
+    state = request.query.get("state")
+
+    if not code or not state:
+        return web.Response(text="Missing code or state parameter.", status=400)
+
+    try:
+        user_id = int(state)
+    except ValueError:
+        return web.Response(text="Invalid state parameter.", status=400)
+
+    try:
+        flow = Flow.from_client_config(
+            _build_oauth_client_config(),
+            scopes=SCOPES,
+            redirect_uri=OAUTH_REDIRECT_URI,
+        )
+        flow.fetch_token(code=code)
+        creds = flow.credentials
+
+        os.makedirs(USER_CREDS_DIR, exist_ok=True)
+        creds_path = get_user_creds_path(user_id)
+        with open(creds_path, "w", encoding="utf-8") as f:
+            f.write(creds.to_json())
+
+        bot = request.app.get("telegram_bot")
+        if bot:
+            try:
+                await bot.send_message(
+                    chat_id=user_id,
+                    text="\u2705 Google account connected successfully!\n\nYou can now upload files to your Google Drive."
+                )
+            except Exception as e:
+                logger.warning(f"Failed to notify user {user_id}: {e}")
+
+        return web.Response(
+            text="<html><body style='font-family:sans-serif;text-align:center;padding:60px'>"
+                 "<h2>\u2705 Google account connected!</h2>"
+                 "<p>You can close this tab and return to Telegram.</p></body></html>",
+            content_type="text/html",
+        )
+    except Exception as e:
+        logger.error(f"OAuth callback failed for user {user_id}: {e}")
+        return web.Response(text=f"Authorization failed: {e}", status=500)
 
 
 async def upload_to_drive(
-    context: ContextTypes.DEFAULT_TYPE,
-    drive,
+    user_id: int,
     filepath: str,
     filename: str,
     file_size: int,
@@ -719,40 +846,29 @@ async def upload_to_drive(
     if should_cancel and should_cancel():
         raise TransferCancelled("Upload cancelled by user")
 
-    print("Uploading to folder:", DRIVE_FOLDER_ID)
-    try:
-        files = await asyncio.to_thread(
-            lambda: drive.ListFile({
-                "q": f"'{DRIVE_FOLDER_ID}' in parents and trashed=false"
-            }).GetList()
-        )
-        print("FILES IN FOLDER:", len(files))
-    except Exception as e:
-        logger.warning(f"Folder pre-check failed: {e}")
+    service = get_user_service(user_id)
 
     def _upload_file():
-        gfile = drive.CreateFile({
-            "title": filename,
-            "parents": [{"id": DRIVE_FOLDER_ID}]
-        })
-        # Re-assert parents to prevent accidental metadata override.
-        gfile["parents"] = [{"id": DRIVE_FOLDER_ID}]
-        gfile.SetContentFile(filepath)
-        gfile.Upload()
-        return gfile
+        file_metadata = {"name": filename}
+        media = MediaFileUpload(filepath, resumable=True)
+        request = service.files().create(
+            body=file_metadata,
+            media_body=media,
+            fields="id"
+        )
+        response = None
+        while response is None:
+            status, response = request.next_chunk()
+        return response.get("id")
 
-    gfile = await asyncio.to_thread(_upload_file)
-    print("Uploaded file ID:", gfile.get("id"))
+    file_id = await asyncio.to_thread(_upload_file)
 
     if progress_callback and file_size:
         await progress_callback(file_size, file_size)
 
-    file_id = gfile.get("id")
     if not file_id:
         raise RuntimeError("Upload completed but file id is missing")
 
-    http = drive.auth.Get_Http_Object()
-    service = build("drive", "v3", http=http, cache_discovery=False)
     await asyncio.to_thread(
         service.permissions().create(
             fileId=file_id,
@@ -932,6 +1048,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👋 Hello! I'm your *Google Drive Upload Bot*.\n\n"
         "Send me any file, photo, video, audio or voice message "
         "and I'll upload it to your Google Drive! 🚀\n\n"
+        "🔗 Use /connect to link your Google account first.\n"
         "✅ Supports files up to *2GB* via local API server.",
         parse_mode="Markdown"
     )
@@ -970,10 +1087,11 @@ async def storage(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("❌ Unauthorized access")
         return
 
+    if not await require_connection(update, user.id):
+        return
+
     try:
-        drive = context.bot_data.get("drive")
-        http = drive.auth.Get_Http_Object()
-        service = build("drive", "v3", http=http, cache_discovery=False)
+        service = get_user_service(user.id)
         about = await asyncio.to_thread(
             service.about().get(fields="storageQuota").execute
         )
@@ -1014,10 +1132,11 @@ async def stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("❌ Unauthorized access")
         return
 
+    if not await require_connection(update, user.id):
+        return
+
     try:
-        drive = context.bot_data.get("drive")
-        http = drive.auth.Get_Http_Object()
-        service = build("drive", "v3", http=http, cache_discovery=False)
+        service = get_user_service(user.id)
 
         about = await asyncio.to_thread(
             service.about().get(fields="storageQuota").execute
@@ -1032,7 +1151,7 @@ async def stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         while True:
             resp = await asyncio.to_thread(
                 service.files().list(
-                    q=f"'{DRIVE_FOLDER_ID}' in parents and trashed = false",
+                    q="'root' in parents and trashed = false",
                     fields="nextPageToken,files(id)",
                     pageSize=1000,
                     pageToken=page_token
@@ -1070,10 +1189,10 @@ async def find_drive_file(service, query_text: str):
             by_id = await asyncio.to_thread(
                 service.files().get(
                     fileId=query_text,
-                    fields="id,name,size,parents,trashed"
+                    fields="id,name,size,trashed"
                 ).execute
             )
-            if not by_id.get("trashed") and DRIVE_FOLDER_ID in (by_id.get("parents") or []):
+            if not by_id.get("trashed"):
                 return {
                     "id": by_id.get("id"),
                     "name": by_id.get("name", "Unnamed file"),
@@ -1087,7 +1206,7 @@ async def find_drive_file(service, query_text: str):
         service.files().list(
             q=(
                 f"name contains '{safe_query}' and "
-                f"'{DRIVE_FOLDER_ID}' in parents and trashed=false"
+                f"trashed=false"
             ),
             orderBy="createdTime desc",
             pageSize=1,
@@ -1128,14 +1247,15 @@ async def get_file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("❌ Unauthorized access")
         return
 
+    if not await require_connection(update, user.id):
+        return
+
     query = " ".join(context.args).strip()
     if not query:
         await message.reply_text("Usage: /get <file_name OR file_id>")
         return
 
-    drive = context.bot_data.get("drive")
-    http = drive.auth.Get_Http_Object()
-    service = build("drive", "v3", http=http, cache_discovery=False)
+    service = get_user_service(user.id)
 
     found = None
     if is_google_drive_link(query):
@@ -1390,8 +1510,11 @@ async def files(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("❌ You don't have access to this command")
         return
 
+    if not await require_connection(update, user.id):
+        return
+
     try:
-        text, keyboard = await build_files_page(context, page=1, page_size=10)
+        text, keyboard = await build_files_page(context, user.id, page=1, page_size=10)
         await message.reply_text(text, reply_markup=keyboard)
     except Exception as e:
         logger.error(f"Files command failed: {e}")
@@ -1404,6 +1527,9 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not user or not has_permission(user.id, context, "files"):
         await message.reply_text("❌ Unauthorized access")
+        return
+
+    if not await require_connection(update, user.id):
         return
 
     raw_query = " ".join(context.args).strip()
@@ -1420,14 +1546,12 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
 
     try:
-        drive = context.bot_data.get("drive")
-        http = drive.auth.Get_Http_Object()
-        service = build("drive", "v3", http=http, cache_discovery=False)
+        service = get_user_service(user.id)
 
         safe_query = escape_drive_query_value(query.lower().strip())
         suggestion_result = await asyncio.to_thread(
             service.files().list(
-                q=f"'{DRIVE_FOLDER_ID}' in parents and trashed = false and name contains '{safe_query}'",
+                q=f"trashed = false and name contains '{safe_query}'",
                 orderBy="createdTime desc",
                 pageSize=11,  # 10 suggestions + 1 extra to know if there are more
                 fields="nextPageToken,files(id,name)"
@@ -1474,15 +1598,13 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text(f"❌ Search failed:\n`{str(e)}`", parse_mode="Markdown")
 
 
-async def build_files_page(context: ContextTypes.DEFAULT_TYPE, page: int, page_size: int = 10):
-    drive = context.bot_data.get("drive")
-    http = drive.auth.Get_Http_Object()
-    service = build("drive", "v3", http=http, cache_discovery=False)
+async def build_files_page(context: ContextTypes.DEFAULT_TYPE, user_id: int, page: int, page_size: int = 10):
+    service = get_user_service(user_id)
 
     # Simulated paging: fetch a bounded latest set, then slice by page index.
     result = await asyncio.to_thread(
         service.files().list(
-            q=f"'{DRIVE_FOLDER_ID}' in parents and trashed = false",
+            q="'root' in parents and trashed = false",
             orderBy="createdTime desc",
             pageSize=150,
             fields="files(id,name)"
@@ -1491,7 +1613,7 @@ async def build_files_page(context: ContextTypes.DEFAULT_TYPE, page: int, page_s
     all_items = result.get("files", [])
 
     if not all_items:
-        return "📂 No files found in the configured Drive folder.", None
+        return "📂 No files found in your Google Drive.", None
 
     total_pages = max(1, (len(all_items) + page_size - 1) // page_size)
     page = max(1, min(page, total_pages))
@@ -1539,14 +1661,12 @@ async def build_search_page(context: ContextTypes.DEFAULT_TYPE, session_id: str,
 
     page_token = tokens[page - 1]
 
-    drive = context.bot_data.get("drive")
-    http = drive.auth.Get_Http_Object()
-    service = build("drive", "v3", http=http, cache_discovery=False)
+    service = get_user_service(context.user_data.get("_oauth_user_id", 0))
 
     safe_query = escape_drive_query_value(query)
     result = await asyncio.to_thread(
         service.files().list(
-            q=f"'{DRIVE_FOLDER_ID}' in parents and trashed = false and name contains '{safe_query}'",
+            q=f"trashed = false and name contains '{safe_query}'",
             orderBy="createdTime desc",
             pageSize=page_size,
             pageToken=page_token,
@@ -1610,9 +1730,8 @@ async def file_view(
     delete_callback: str | None = None
 ):
     query = update.callback_query
-    drive = context.bot_data.get("drive")
-    http = drive.auth.Get_Http_Object()
-    service = build("drive", "v3", http=http, cache_discovery=False)
+    user_id = update.effective_user.id
+    service = get_user_service(user_id)
 
     details = await asyncio.to_thread(
         service.files().get(
@@ -1663,6 +1782,7 @@ async def file_view(
 
 async def refresh_file_view_message(
     context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
     chat_id: int,
     message_id: int,
     file_id: str,
@@ -1670,9 +1790,7 @@ async def refresh_file_view_message(
     back_callback: str | None = None,
     delete_callback: str | None = None
 ):
-    drive = context.bot_data.get("drive")
-    http = drive.auth.Get_Http_Object()
-    service = build("drive", "v3", http=http, cache_discovery=False)
+    service = get_user_service(user_id)
 
     details = await asyncio.to_thread(
         service.files().get(
@@ -1759,7 +1877,8 @@ async def files_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
 
         if action == "files_page":
             page = int(payload.get("page", 1))
-            text, keyboard = await build_files_page(context, page=page, page_size=10)
+            context.user_data["_oauth_user_id"] = user.id
+            text, keyboard = await build_files_page(context, user.id, page=page, page_size=10)
             await query.edit_message_text(text=text, reply_markup=keyboard)
             await query.answer()
             return
@@ -1767,6 +1886,7 @@ async def files_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         if action == "search_page":
             session_id = str(payload.get("session_id"))
             page = int(payload.get("page", 1))
+            context.user_data["_oauth_user_id"] = user.id
             text, keyboard = await build_search_page(context, session_id=session_id, page=page, page_size=10)
             await query.edit_message_text(text=text, reply_markup=keyboard, disable_web_page_preview=True)
             await query.answer()
@@ -1811,11 +1931,9 @@ async def files_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         if action == "delete_from_files":
             file_id = payload.get("file_id")
             page = int(payload.get("page", 1))
-            drive = context.bot_data.get("drive")
-            http = drive.auth.Get_Http_Object()
-            service = build("drive", "v3", http=http, cache_discovery=False)
+            service = get_user_service(user.id)
             await asyncio.to_thread(service.files().delete(fileId=file_id).execute)
-            text, keyboard = await build_files_page(context, page=page, page_size=10)
+            text, keyboard = await build_files_page(context, user.id, page=page, page_size=10)
             await query.edit_message_text(text=text, reply_markup=keyboard)
             await query.answer("✅ File deleted")
             return
@@ -1824,10 +1942,9 @@ async def files_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
             file_id = payload.get("file_id")
             session_id = str(payload.get("session_id"))
             page = int(payload.get("page", 1))
-            drive = context.bot_data.get("drive")
-            http = drive.auth.Get_Http_Object()
-            service = build("drive", "v3", http=http, cache_discovery=False)
+            service = get_user_service(user.id)
             await asyncio.to_thread(service.files().delete(fileId=file_id).execute)
+            context.user_data["_oauth_user_id"] = user.id
             text, keyboard = await build_search_page(context, session_id=session_id, page=page, page_size=10)
             await query.edit_message_text(text=text, reply_markup=keyboard, disable_web_page_preview=True)
             await query.answer("✅ File deleted")
@@ -1835,9 +1952,7 @@ async def files_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
 
         if action == "delete_upload":
             file_id = payload.get("file_id")
-            drive = context.bot_data.get("drive")
-            http = drive.auth.Get_Http_Object()
-            service = build("drive", "v3", http=http, cache_discovery=False)
+            service = get_user_service(user.id)
             await asyncio.to_thread(service.files().delete(fileId=file_id).execute)
             await query.edit_message_text("✅ File deleted from Google Drive.")
             await query.answer("✅ File deleted")
@@ -1845,9 +1960,7 @@ async def files_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
 
         if action in {"public", "private"}:
             file_id = payload.get("file_id")
-            drive = context.bot_data.get("drive")
-            http = drive.auth.Get_Http_Object()
-            service = build("drive", "v3", http=http, cache_discovery=False)
+            service = get_user_service(user.id)
 
             if action == "public":
                 if not await is_file_public(service, file_id):
@@ -1871,6 +1984,7 @@ async def files_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
             if current_view.get("file_id") == file_id and current_view.get("message_id") == (query.message.message_id if query.message else None):
                 await refresh_file_view_message(
                     context=context,
+                    user_id=user.id,
                     chat_id=current_view["chat_id"],
                     message_id=current_view["message_id"],
                     file_id=file_id,
@@ -1888,12 +2002,10 @@ async def files_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         if action == "expire_link":
             file_id = payload.get("file_id")
             duration = int(payload.get("duration", 3600))
-            drive = context.bot_data.get("drive")
-            http = drive.auth.Get_Http_Object()
-            service = build("drive", "v3", http=http, cache_discovery=False)
+            service = get_user_service(user.id)
 
             permission_id = await ensure_public_permission(service, file_id)
-            asyncio.create_task(revoke_public_after_delay(context, file_id, permission_id, duration))
+            asyncio.create_task(revoke_public_after_delay(context, user.id, file_id, permission_id, duration))
             context.bot_data.setdefault("exp_links", {})[file_id] = time.time() + duration
 
             hours_label = "1 hour" if duration == 3600 else ("24 hours" if duration == 86400 else f"{duration}s")
@@ -1950,9 +2062,7 @@ async def handle_rename_input(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     try:
-        drive = context.bot_data.get("drive")
-        http = drive.auth.Get_Http_Object()
-        service = build("drive", "v3", http=http, cache_discovery=False)
+        service = get_user_service(user.id)
         updated = await asyncio.to_thread(
             service.files().update(
                 fileId=file_id,
@@ -1968,6 +2078,7 @@ async def handle_rename_input(update: Update, context: ContextTypes.DEFAULT_TYPE
         if rename_return:
             await refresh_file_view_message(
                 context=context,
+                user_id=user.id,
                 chat_id=rename_return["chat_id"],
                 message_id=rename_return["message_id"],
                 file_id=rename_return["file_id"],
@@ -2057,9 +2168,7 @@ async def duplicate_upload_callback(update: Update, context: ContextTypes.DEFAUL
         existing_file_id = task_data.get("existing_file_id")
         if existing_file_id:
             try:
-                drive = context.bot_data.get("drive")
-                http = drive.auth.Get_Http_Object()
-                service = build("drive", "v3", http=http, cache_discovery=False)
+                service = get_user_service(user.id)
                 await asyncio.to_thread(
                     service.files().delete(fileId=existing_file_id).execute
                 )
@@ -2154,7 +2263,8 @@ async def run_transfer_pipeline(
     if not message:
         return
 
-    drive = context.bot_data.get("drive")
+    user = update.effective_user
+    user_id = user.id if user else 0
     upload_semaphore = context.bot_data.get("upload_semaphore")
 
     known_size = int(file_size or 0)
@@ -2340,8 +2450,7 @@ async def run_transfer_pipeline(
 
     # Duplicate detection by exact filename and size before upload.
     try:
-        http = drive.auth.Get_Http_Object()
-        service = build("drive", "v3", http=http, cache_discovery=False)
+        service = get_user_service(user_id)
         existing_id = await check_duplicate(service, filename, known_size)
     except Exception as e:
         logger.warning(f"Duplicate check failed, continuing upload: {e}")
@@ -2392,8 +2501,7 @@ async def run_transfer_pipeline(
             async with upload_semaphore:
                 await update_upload_progress(0, known_size)
                 uploaded_file_id, _ = await upload_to_drive(
-                    context,
-                    drive,
+                    user_id,
                     local_path,
                     filename,
                     file_size=known_size,
@@ -2402,8 +2510,7 @@ async def run_transfer_pipeline(
                 )
         else:
             uploaded_file_id, _ = await upload_to_drive(
-                context,
-                drive,
+                user_id,
                 local_path,
                 filename,
                 file_size=known_size,
@@ -2414,6 +2521,7 @@ async def run_transfer_pipeline(
         await send_uploaded_ui(
             update,
             context,
+            user_id,
             uploaded_file_id,
             filename,
             message_to_edit=progress_msg,
@@ -2452,6 +2560,9 @@ async def handle_url_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     if not user or not has_permission(user.id, context, "upload"):
         await message.reply_text("❌ Unauthorized access")
+        return
+
+    if not await require_connection(update, user.id):
         return
 
     parsed = urlparse(url)
@@ -2503,6 +2614,9 @@ async def handle_drive_link_message(update: Update, context: ContextTypes.DEFAUL
         await message.reply_text("❌ Unauthorized access")
         return True
 
+    if not await require_connection(update, user.id):
+        return True
+
     file_id = extract_drive_file_id(url)
     if not file_id:
         await message.reply_text("❌ Invalid Google Drive link")
@@ -2510,10 +2624,11 @@ async def handle_drive_link_message(update: Update, context: ContextTypes.DEFAUL
 
     status_msg = await message.reply_text("📎 Cloning Google Drive file...")
     try:
-        cloned = await clone_drive_file(context, file_id)
+        cloned = await clone_drive_file(user.id, file_id)
         await send_uploaded_ui(
             update,
             context,
+            user.id,
             cloned["id"],
             cloned.get("name", "cloned_file"),
             message_to_edit=status_msg,
@@ -2542,10 +2657,13 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
 
-    # Access control: only allow the owner to use file handlers.
+    # Access control
     user = update.effective_user
     if not user or not has_permission(user.id, context, "upload"):
         await message.reply_text("❌ Unauthorized access")
+        return
+
+    if not await require_connection(update, user.id):
         return
 
     # Detect file type
@@ -2622,25 +2740,31 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def start_oauth_server(telegram_bot):
+    """Start the aiohttp web server for OAuth callbacks."""
+    oauth_app = web.Application()
+    oauth_app["telegram_bot"] = telegram_bot
+    oauth_app.router.add_get("/oauth/callback", handle_oauth_callback)
+    runner = web.AppRunner(oauth_app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", OAUTH_SERVER_PORT)
+    await site.start()
+    logger.info(f"OAuth callback server started on port {OAUTH_SERVER_PORT}")
+    return runner
+
+
 def main():
-    if not DRIVE_FOLDER_ID:
-        raise RuntimeError("DRIVE_FOLDER_ID is required")
-
     fix_volume_permissions()
-    logger.info("Authenticating with Google Drive...")
-    drive = get_drive()
-    logger.info("✅ Google Drive ready")
+    os.makedirs(USER_CREDS_DIR, exist_ok=True)
 
-    app = (
-        ApplicationBuilder()
-        .token(TELEGRAM_TOKEN)
-        .base_url(LOCAL_API_URL)   # Use local API server
-        .local_mode(True)          # Enable local mode for large files
-        .concurrent_updates(True)
-        .build()
-    )
+    builder = ApplicationBuilder().token(TELEGRAM_TOKEN).concurrent_updates(True)
+    if USE_LOCAL_API:
+        builder = builder.base_url(LOCAL_API_URL).local_mode(True)
+        logger.info("Using local Telegram Bot API server")
+    else:
+        logger.info("Using standard Telegram API")
+    app = builder.build()
 
-    app.bot_data["drive"] = drive
     app.bot_data["upload_semaphore"] = asyncio.Semaphore(MAX_PARALLEL_UPLOADS)
     app.bot_data["users"] = load_allowed_users()
     app.bot_data["admins"] = load_admin_users()
@@ -2649,6 +2773,8 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("commands", commands_handler))
+    app.add_handler(CommandHandler("connect", connect_handler))
+    app.add_handler(CommandHandler("disconnect", disconnect_handler))
     app.add_handler(CommandHandler("storage", storage))
     app.add_handler(CommandHandler("stats", stats_handler))
     app.add_handler(CommandHandler("analytics", analytics_handler))
@@ -2681,5 +2807,20 @@ def main():
 
 
 if __name__ == "__main__":
-    app = main()
-    app.run_polling()
+    telegram_app = main()
+
+    async def run():
+        async with telegram_app:
+            oauth_runner = await start_oauth_server(telegram_app.bot)
+            try:
+                await telegram_app.start()
+                await telegram_app.updater.start_polling()
+                logger.info("✅ Bot and OAuth server are running")
+                stop_event = asyncio.Event()
+                await stop_event.wait()
+            finally:
+                await telegram_app.updater.stop()
+                await telegram_app.stop()
+                await oauth_runner.cleanup()
+
+    asyncio.run(run())
