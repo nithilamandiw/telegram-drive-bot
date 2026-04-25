@@ -1310,23 +1310,15 @@ async def main_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await query.answer()
 
     if action == "connect":
-        # Trigger connect flow
-        flow = InstalledAppFlow.from_client_config(
-            {
-                "installed": {
-                    "client_id": GOOGLE_CLIENT_ID,
-                    "client_secret": GOOGLE_CLIENT_SECRET,
-                    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-                    "token_uri": "https://oauth2.googleapis.com/token",
-                    "redirect_uris": [OAUTH_REDIRECT_URI],
-                }
-            },
+        # Trigger connect flow (same as /connect command)
+        flow = Flow.from_client_config(
+            _build_oauth_client_config(),
             scopes=SCOPES,
+            redirect_uri=OAUTH_REDIRECT_URI,
         )
         auth_url, _ = flow.authorization_url(
             access_type="offline",
             prompt="consent",
-            redirect_uri=OAUTH_REDIRECT_URI,
             state=str(user.id),
         )
         await query.edit_message_text(
