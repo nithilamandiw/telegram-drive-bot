@@ -899,8 +899,12 @@ async def download_via_local_api(
             logger.warning("Local API getFile returned no file_path")
             return False
 
-        # In local mode, file_path is an absolute path inside the container
-        # Remap it to the host volume path
+        # In local mode, file_path may include the full URL prefix
+        # Extract just the container path (e.g. /var/lib/telegram-bot-api/...)
+        if LOCAL_API_DIR in file_path:
+            file_path = file_path[file_path.index(LOCAL_API_DIR):]
+
+        # Remap container path to host volume path
         host_file_path = file_path.replace(LOCAL_API_DIR, VOLUME_HOST_PATH, 1)
         if task_state is not None:
             task_state["url"] = host_file_path
