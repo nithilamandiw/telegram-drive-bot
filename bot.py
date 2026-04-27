@@ -2818,6 +2818,8 @@ async def run_transfer_pipeline(
         "file_path": local_path,
         "url": None,
         "stage": "download",
+        "attempt": 1,
+        "max_attempts": 1,
     }
 
     def transfer_keyboard():
@@ -2883,6 +2885,11 @@ async def run_transfer_pipeline(
                     eta_text = f"{int(round(remaining_bytes / speed_bps))}s"
 
         try:
+            task = context.bot_data.get("transfer_tasks", {}).get(task_id, {})
+            attempt = task.get("attempt", 1)
+            max_attempts = task.get("max_attempts", 1)
+            attempt_label = f" (attempt {attempt}/{max_attempts})" if max_attempts > 1 else ""
+
             if total > 0:
                 percent = min(100, int(done * 100 / total))
                 total_mb = total / (1024 * 1024)
@@ -2890,7 +2897,7 @@ async def run_transfer_pipeline(
                 text = (
                     f"{emoji} {filename}\n"
                     f"📦 {size_label}\n\n"
-                    f"⬇️ Downloading... {percent}%\n"
+                    f"⬇️ Downloading... {percent}%{attempt_label}\n"
                     f"{bar}\n"
                     f"{done_mb:.2f}/{total_mb:.2f} MB\n\n"
                     f"🚀 Speed: {speed_text}\n"
@@ -2900,7 +2907,7 @@ async def run_transfer_pipeline(
                 text = (
                     f"{emoji} {filename}\n"
                     f"📦 {size_label}\n\n"
-                    f"⬇️ Downloading...\n"
+                    f"⬇️ Downloading...{attempt_label}\n"
                     f"{done_mb:.2f} MB downloaded\n\n"
                     f"🚀 Speed: {speed_text}\n"
                     f"⏱ ETA: --"
@@ -3244,7 +3251,18 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         max_retries = 5
         retry_delays = [5, 10, 20, 30, 60]  # seconds between retries
 
+        # Store max_attempts in task_state so progress bar can show it
+        if task_state is not None:
+            task_state["max_attempts"] = max_retries
+
         for attempt in range(1, max_retries + 1):
+            # Update current attempt in task_state for progress bar display
+            if task_state is not None:
+                task_state["attempt"] = attempt
+
+            # Reset progress timing for each new attempt
+            progress_state["download_start_time"] = None
+
             try:
                 downloaded = await download_via_local_api(
                     context.bot,
@@ -3294,26 +3312,30 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if should_cancel and should_cancel():
                 raise TransferCancelled("Download cancelled by user")
 
-            # Show retry status to user via progress message
+            # Show retry countdown to user
             delay = retry_delays[min(attempt - 1, len(retry_delays) - 1)]
             logger.info(f"Download attempt {attempt}/{max_retries} failed, retrying in {delay}s...")
-            try:
-                await progress_msg.edit_text(
-                    f"{emoji} {filename}\n"
-                    f"📦 {size_label}\n\n"
-                    f"🔄 Download attempt {attempt} failed, retrying in {delay}s...\n"
-                    f"Attempt {attempt}/{max_retries}",
-                    reply_markup=transfer_keyboard()
-                )
-            except Exception:
-                pass
 
-            # Wait before retrying, checking for cancellation periodically
-            for _ in range(delay):
+            # Live countdown timer during retry wait
+            for remaining in range(delay, 0, -1):
                 if should_cancel and should_cancel():
                     raise TransferCancelled("Download cancelled by user")
                 if task_state and task_state.get("cancel"):
                     raise TransferCancelled("Download cancelled by user")
+
+                try:
+                    countdown_bar = progress_bar(int((delay - remaining) * 100 / delay))
+                    await progress_msg.edit_text(
+                        f"{emoji} {filename}\n"
+                        f"📦 {size_label}\n\n"
+                        f"🔄 Attempt {attempt}/{max_retries} failed\n"
+                        f"⏳ Retrying in {remaining}s...\n"
+                        f"{countdown_bar}",
+                        reply_markup=transfer_keyboard()
+                    )
+                except Exception:
+                    pass
+
                 await asyncio.sleep(1)
 
             # Clean up partial file before retrying
