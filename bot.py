@@ -3456,9 +3456,11 @@ def main():
     builder = ApplicationBuilder().token(TELEGRAM_TOKEN).concurrent_updates(True)
     if USE_LOCAL_API:
         custom_request = HTTPXRequest(
+            connection_pool_size=20,
             read_timeout=300,
             write_timeout=300,
             connect_timeout=30,
+            pool_timeout=10,
         )
         builder = (
             builder
