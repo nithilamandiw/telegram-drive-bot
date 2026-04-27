@@ -3061,6 +3061,8 @@ async def run_transfer_pipeline(
                 "░░░█░░░░░░░░",
             ]
             frame_idx = 0
+            start = time.time()
+            max_processing_time = 30  # stop animation after 30 seconds
             task = context.bot_data.get("transfer_tasks", {}).get(task_id, {})
             attempt_num = task.get("attempt", 1)
             max_att = task.get("max_attempts", 1)
@@ -3070,18 +3072,27 @@ async def run_transfer_pipeline(
                 # Stop if real download progress has started
                 if progress_state["download_start_time"] is not None:
                     break
+                # Stop if cancelled or paused
+                if is_cancelled() or (task_ref and task_ref.get("cancel")):
+                    break
+                # Stop after max processing time
+                elapsed = int(time.time() - start)
+                if elapsed >= max_processing_time:
+                    break
+                remaining = max_processing_time - elapsed
                 try:
                     await progress_msg.edit_text(
                         f"{emoji} {filename}\n"
                         f"📦 {size_label}\n\n"
                         f"⏳ Processing file...{attempt_label}\n"
-                        f"{frames[frame_idx % len(frames)]}",
+                        f"{frames[frame_idx % len(frames)]}\n"
+                        f"⏱ Timeout: {remaining}s",
                         reply_markup=transfer_keyboard()
                     )
                 except Exception:
                     pass
                 frame_idx += 1
-                await asyncio.sleep(1.5)
+                await asyncio.sleep(2)
 
         anim_task = asyncio.create_task(processing_animation())
 
