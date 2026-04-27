@@ -2965,7 +2965,13 @@ async def run_transfer_pipeline(
     except Exception as e:
         cleanup_local_file()
         context.bot_data.get("transfer_tasks", {}).pop(task_id, None)
-        await message.reply_text(f"❌ Download failed:\n`{str(e)}`", parse_mode="Markdown")
+        logger.error(f"Download failed for {filename}: {e}")
+        await progress_msg.edit_text(
+            f"❌ Download failed\n\n"
+            f"{emoji} {filename}\n"
+            f"📦 {size_label}\n\n"
+            f"Please try sending the file again."
+        )
         return
 
     if not downloaded:
@@ -3232,38 +3238,101 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     async def telegram_download_runner(local_path, known_size, progress_callback, should_cancel, task_state):
-        try:
-            downloaded = await download_via_local_api(
-                context.bot,
-                file_id,
-                local_path,
-                file_size=known_size,
-                progress_callback=progress_callback,
-                should_cancel=should_cancel,
-                task_state=task_state,
-            )
-        except TransferCancelled:
-            raise
+        max_retries = 5
+        retry_delays = [5, 10, 20, 30, 60]  # seconds between retries
 
-        if downloaded:
-            return True
+        for attempt in range(1, max_retries + 1):
+            try:
+                downloaded = await download_via_local_api(
+                    context.bot,
+                    file_id,
+                    local_path,
+                    file_size=known_size,
+                    progress_callback=progress_callback,
+                    should_cancel=should_cancel,
+                    task_state=task_state,
+                )
+            except TransferCancelled:
+                raise
+            except Exception as e:
+                logger.warning(f"Local API download attempt {attempt} raised exception: {e}")
+                downloaded = False
 
-        if known_size and known_size > 20 * 1024 * 1024:
-            size_mb = known_size / (1024 * 1024)
-            raise RuntimeError(
-                "Download failed. File is too large for CDN fallback "
-                f"({size_mb:.2f} MB). Ensure local API Docker is running."
-            )
+            if downloaded:
+                return True
 
-        logger.info("Falling back to Telegram CDN (file is under 20MB)...")
-        return await download_via_cdn(
-            file_id,
-            local_path,
-            file_size=known_size,
-            progress_callback=progress_callback,
-            should_cancel=should_cancel,
-            task_state=task_state,
-        )
+            # For small files (<=20MB), try CDN fallback before retrying local API
+            if known_size and known_size <= 20 * 1024 * 1024:
+                logger.info("Falling back to Telegram CDN (file is under 20MB)...")
+                try:
+                    cdn_result = await download_via_cdn(
+                        file_id,
+                        local_path,
+                        file_size=known_size,
+                        progress_callback=progress_callback,
+                        should_cancel=should_cancel,
+                        task_state=task_state,
+                    )
+                    if cdn_result:
+                        return True
+                except TransferCancelled:
+                    raise
+                except Exception as e:
+                    logger.warning(f"CDN fallback also failed: {e}")
+
+            # If this was the last attempt, give up
+            if attempt >= max_retries:
+                logger.error(f"Download failed after {max_retries} attempts for file_id={file_id}")
+                raise RuntimeError(
+                    "Download failed after multiple attempts. Please try sending the file again."
+                )
+
+            # Check cancellation before waiting for retry
+            if should_cancel and should_cancel():
+                raise TransferCancelled("Download cancelled by user")
+
+            # Show retry status to user via progress message
+            delay = retry_delays[min(attempt - 1, len(retry_delays) - 1)]
+            logger.info(f"Download attempt {attempt}/{max_retries} failed, retrying in {delay}s...")
+            try:
+                await progress_msg.edit_text(
+                    f"{emoji} {filename}\n"
+                    f"📦 {size_label}\n\n"
+                    f"🔄 Download attempt {attempt} failed, retrying in {delay}s...\n"
+                    f"Attempt {attempt}/{max_retries}",
+                    reply_markup=transfer_keyboard()
+                )
+            except Exception:
+                pass
+
+            # Wait before retrying, checking for cancellation periodically
+            for _ in range(delay):
+                if should_cancel and should_cancel():
+                    raise TransferCancelled("Download cancelled by user")
+                if task_state and task_state.get("cancel"):
+                    raise TransferCancelled("Download cancelled by user")
+                await asyncio.sleep(1)
+
+            # Clean up partial file before retrying
+            if os.path.exists(local_path):
+                try:
+                    os.remove(local_path)
+                except Exception:
+                    pass
+
+            # Reset progress for next attempt
+            if task_state is not None:
+                task_state["downloaded"] = 0
+
+            try:
+                await progress_msg.edit_text(
+                    f"{emoji} {filename}\n"
+                    f"📦 {size_label}\n\n"
+                    f"🔄 Retrying download... (attempt {attempt + 1}/{max_retries})",
+                    reply_markup=transfer_keyboard()
+                )
+            except Exception:
+                pass
 
     await run_transfer_pipeline(
         update,
