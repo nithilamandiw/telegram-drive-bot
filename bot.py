@@ -20,6 +20,7 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.request import HTTPXRequest
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, CallbackQueryHandler, filters, ContextTypes
 from aiohttp import web
 
@@ -3388,14 +3389,17 @@ def main():
 
     builder = ApplicationBuilder().token(TELEGRAM_TOKEN).concurrent_updates(True)
     if USE_LOCAL_API:
+        custom_request = HTTPXRequest(
+            read_timeout=300,
+            write_timeout=300,
+            connect_timeout=30,
+        )
         builder = (
             builder
             .base_url(LOCAL_API_URL)
             .base_file_url(LOCAL_FILE_URL)
             .local_mode(True)
-            .read_timeout(300)
-            .write_timeout(300)
-            .connect_timeout(30)
+            .request(custom_request)
         )
         logger.info("Using local Telegram Bot API server (extended timeouts)")
     else:
