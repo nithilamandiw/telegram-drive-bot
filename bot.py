@@ -1046,8 +1046,11 @@ async def download_via_local_api(
 ) -> bool:
     """Download file using the bot's built-in local API support."""
     try:
-        # Use the bot's get_file which properly handles local mode
-        file_obj = await bot.get_file(file_id)
+        # Use the bot's get_file which properly handles local mode.
+        # In local API mode, the server must download the file from Telegram
+        # before responding — this can take several minutes for large files,
+        # so we set a generous read timeout (10 minutes).
+        file_obj = await bot.get_file(file_id, read_timeout=600, write_timeout=60, connect_timeout=30)
         file_path = file_obj.file_path
 
         if not file_path:
@@ -3363,8 +3366,16 @@ def main():
 
     builder = ApplicationBuilder().token(TELEGRAM_TOKEN).concurrent_updates(True)
     if USE_LOCAL_API:
-        builder = builder.base_url(LOCAL_API_URL).base_file_url(LOCAL_FILE_URL).local_mode(True)
-        logger.info("Using local Telegram Bot API server")
+        builder = (
+            builder
+            .base_url(LOCAL_API_URL)
+            .base_file_url(LOCAL_FILE_URL)
+            .local_mode(True)
+            .read_timeout(300)
+            .write_timeout(300)
+            .connect_timeout(30)
+        )
+        logger.info("Using local Telegram Bot API server (extended timeouts)")
     else:
         logger.info("Using standard Telegram API")
     app = builder.build()
