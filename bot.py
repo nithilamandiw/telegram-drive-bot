@@ -1284,6 +1284,11 @@ async def build_main_menu(user_id: int, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("\u274c Remove Admin", callback_data="menu_removeadmin"),
         ])
 
+    if has_permission(user_id, context, "broadcast"):
+        buttons.append([
+            InlineKeyboardButton("\U0001f4e2 Broadcast", callback_data="menu_broadcast"),
+        ])
+
     keyboard = InlineKeyboardMarkup(buttons)
     return greeting, keyboard
 
@@ -1556,6 +1561,16 @@ async def main_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.edit_message_text(
             f"\u2699\ufe0f *{action.replace('add', 'Add ').replace('remove', 'Remove ').title()}*\n\n"
             f"Use: `{cmd} <telegram_user_id>`\n\n"
+            "Then press /start to return to the menu.",
+            parse_mode="Markdown",
+        )
+        return
+
+    if action == "broadcast":
+        await query.edit_message_text(
+            "\U0001f4e2 *Broadcast Message*\n\n"
+            "Send a message to all registered users:\n\n"
+            "`/broadcast Your message here`\n\n"
             "Then press /start to return to the menu.",
             parse_mode="Markdown",
         )
