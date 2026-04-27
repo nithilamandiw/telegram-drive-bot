@@ -2796,6 +2796,7 @@ async def run_transfer_pipeline(
     emoji: str,
     download_runner,
     download_dir: str = "/tmp",
+    max_download_retries: int = 1,
 ):
     message = update.message if update.message else (update.callback_query.message if update.callback_query else None)
     if not message:
@@ -2960,35 +2961,108 @@ async def run_transfer_pipeline(
         except Exception:
             pass
 
-    try:
-        downloaded = await download_runner(
-            local_path,
-            known_size,
-            update_download_progress,
-            is_cancelled,
-            context.bot_data.get("transfer_tasks", {}).get(task_id),
-        )
-    except TransferCancelled:
-        cleanup_local_file()
-        await progress_msg.edit_text("❌ Cancelled")
-        context.bot_data.get("transfer_tasks", {}).pop(task_id, None)
-        return
-    except Exception as e:
-        cleanup_local_file()
-        context.bot_data.get("transfer_tasks", {}).pop(task_id, None)
-        logger.error(f"Download failed for {filename}: {e}")
-        await progress_msg.edit_text(
-            f"❌ Download failed\n\n"
-            f"{emoji} {filename}\n"
-            f"📦 {size_label}\n\n"
-            f"Please try sending the file again."
-        )
-        return
+    # -- Download phase with retry logic --
+    retry_delays = [5, 10, 20, 30, 60]
+    task_ref = context.bot_data.get("transfer_tasks", {}).get(task_id)
 
-    if not downloaded:
-        await message.reply_text("❌ Could not download the file. Please try again.")
-        context.bot_data.get("transfer_tasks", {}).pop(task_id, None)
-        return
+    if task_ref is not None:
+        task_ref["max_attempts"] = max_download_retries
+
+    downloaded = False
+    for attempt in range(1, max_download_retries + 1):
+        # Update attempt info in task_state for progress bar display
+        if task_ref is not None:
+            task_ref["attempt"] = attempt
+
+        # Reset speed/ETA stats for each new attempt
+        progress_state["download_start_time"] = None
+
+        try:
+            downloaded = await download_runner(
+                local_path,
+                known_size,
+                update_download_progress,
+                is_cancelled,
+                task_ref,
+            )
+        except TransferCancelled:
+            cleanup_local_file()
+            await progress_msg.edit_text("❌ Cancelled")
+            context.bot_data.get("transfer_tasks", {}).pop(task_id, None)
+            return
+        except Exception as e:
+            logger.warning(f"Download attempt {attempt}/{max_download_retries} failed for {filename}: {e}")
+            downloaded = False
+
+        if downloaded:
+            break
+
+        # If this was the last attempt, show final failure
+        if attempt >= max_download_retries:
+            cleanup_local_file()
+            context.bot_data.get("transfer_tasks", {}).pop(task_id, None)
+            logger.error(f"Download failed after {max_download_retries} attempts for {filename}")
+            await progress_msg.edit_text(
+                f"❌ Download failed\n\n"
+                f"{emoji} {filename}\n"
+                f"📦 {size_label}\n\n"
+                f"Please try sending the file again."
+            )
+            return
+
+        # Check cancellation before waiting for retry
+        if is_cancelled():
+            cleanup_local_file()
+            await progress_msg.edit_text("❌ Cancelled")
+            context.bot_data.get("transfer_tasks", {}).pop(task_id, None)
+            return
+
+        # Live countdown timer during retry wait
+        delay = retry_delays[min(attempt - 1, len(retry_delays) - 1)]
+        logger.info(f"Download attempt {attempt}/{max_download_retries} failed, retrying in {delay}s...")
+
+        for remaining in range(delay, 0, -1):
+            if is_cancelled() or (task_ref and task_ref.get("cancel")):
+                cleanup_local_file()
+                await progress_msg.edit_text("❌ Cancelled")
+                context.bot_data.get("transfer_tasks", {}).pop(task_id, None)
+                return
+
+            try:
+                countdown_bar = progress_bar(int((delay - remaining) * 100 / delay))
+                await progress_msg.edit_text(
+                    f"{emoji} {filename}\n"
+                    f"📦 {size_label}\n\n"
+                    f"🔄 Attempt {attempt}/{max_download_retries} failed\n"
+                    f"⏳ Retrying in {remaining}s...\n"
+                    f"{countdown_bar}",
+                    reply_markup=transfer_keyboard()
+                )
+            except Exception:
+                pass
+
+            await asyncio.sleep(1)
+
+        # Clean up partial file before retrying
+        if os.path.exists(local_path):
+            try:
+                os.remove(local_path)
+            except Exception:
+                pass
+
+        # Reset progress for next attempt
+        if task_ref is not None:
+            task_ref["downloaded"] = 0
+
+        try:
+            await progress_msg.edit_text(
+                f"{emoji} {filename}\n"
+                f"📦 {size_label}\n\n"
+                f"🔄 Retrying download... (attempt {attempt + 1}/{max_download_retries})",
+                reply_markup=transfer_keyboard()
+            )
+        except Exception:
+            pass
 
     if known_size <= 0:
         known_size = int(context.bot_data.get("transfer_tasks", {}).get(task_id, {}).get("downloaded", 0) or 0)
@@ -3249,24 +3323,31 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     async def telegram_download_runner(local_path, known_size, progress_callback, should_cancel, task_state):
-        max_retries = 5
-        retry_delays = [5, 10, 20, 30, 60]  # seconds between retries
+        """Single-attempt download: try local API, then CDN fallback for small files."""
+        try:
+            downloaded = await download_via_local_api(
+                context.bot,
+                file_id,
+                local_path,
+                file_size=known_size,
+                progress_callback=progress_callback,
+                should_cancel=should_cancel,
+                task_state=task_state,
+            )
+        except TransferCancelled:
+            raise
+        except Exception as e:
+            logger.warning(f"Local API download error: {e}")
+            downloaded = False
 
-        # Store max_attempts in task_state so progress bar can show it
-        if task_state is not None:
-            task_state["max_attempts"] = max_retries
+        if downloaded:
+            return True
 
-        for attempt in range(1, max_retries + 1):
-            # Update current attempt in task_state for progress bar display
-            if task_state is not None:
-                task_state["attempt"] = attempt
-
-            # Reset progress timing for each new attempt
-            progress_state["download_start_time"] = None
-
+        # For small files (<=20MB), try CDN fallback
+        if known_size and known_size <= 20 * 1024 * 1024:
+            logger.info("Falling back to Telegram CDN (file is under 20MB)...")
             try:
-                downloaded = await download_via_local_api(
-                    context.bot,
+                cdn_result = await download_via_cdn(
                     file_id,
                     local_path,
                     file_size=known_size,
@@ -3274,91 +3355,14 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     should_cancel=should_cancel,
                     task_state=task_state,
                 )
+                if cdn_result:
+                    return True
             except TransferCancelled:
                 raise
             except Exception as e:
-                logger.warning(f"Local API download attempt {attempt} raised exception: {e}")
-                downloaded = False
+                logger.warning(f"CDN fallback also failed: {e}")
 
-            if downloaded:
-                return True
-
-            # For small files (<=20MB), try CDN fallback before retrying local API
-            if known_size and known_size <= 20 * 1024 * 1024:
-                logger.info("Falling back to Telegram CDN (file is under 20MB)...")
-                try:
-                    cdn_result = await download_via_cdn(
-                        file_id,
-                        local_path,
-                        file_size=known_size,
-                        progress_callback=progress_callback,
-                        should_cancel=should_cancel,
-                        task_state=task_state,
-                    )
-                    if cdn_result:
-                        return True
-                except TransferCancelled:
-                    raise
-                except Exception as e:
-                    logger.warning(f"CDN fallback also failed: {e}")
-
-            # If this was the last attempt, give up
-            if attempt >= max_retries:
-                logger.error(f"Download failed after {max_retries} attempts for file_id={file_id}")
-                raise RuntimeError(
-                    "Download failed after multiple attempts. Please try sending the file again."
-                )
-
-            # Check cancellation before waiting for retry
-            if should_cancel and should_cancel():
-                raise TransferCancelled("Download cancelled by user")
-
-            # Show retry countdown to user
-            delay = retry_delays[min(attempt - 1, len(retry_delays) - 1)]
-            logger.info(f"Download attempt {attempt}/{max_retries} failed, retrying in {delay}s...")
-
-            # Live countdown timer during retry wait
-            for remaining in range(delay, 0, -1):
-                if should_cancel and should_cancel():
-                    raise TransferCancelled("Download cancelled by user")
-                if task_state and task_state.get("cancel"):
-                    raise TransferCancelled("Download cancelled by user")
-
-                try:
-                    countdown_bar = progress_bar(int((delay - remaining) * 100 / delay))
-                    await progress_msg.edit_text(
-                        f"{emoji} {filename}\n"
-                        f"📦 {size_label}\n\n"
-                        f"🔄 Attempt {attempt}/{max_retries} failed\n"
-                        f"⏳ Retrying in {remaining}s...\n"
-                        f"{countdown_bar}",
-                        reply_markup=transfer_keyboard()
-                    )
-                except Exception:
-                    pass
-
-                await asyncio.sleep(1)
-
-            # Clean up partial file before retrying
-            if os.path.exists(local_path):
-                try:
-                    os.remove(local_path)
-                except Exception:
-                    pass
-
-            # Reset progress for next attempt
-            if task_state is not None:
-                task_state["downloaded"] = 0
-
-            try:
-                await progress_msg.edit_text(
-                    f"{emoji} {filename}\n"
-                    f"📦 {size_label}\n\n"
-                    f"🔄 Retrying download... (attempt {attempt + 1}/{max_retries})",
-                    reply_markup=transfer_keyboard()
-                )
-            except Exception:
-                pass
+        return False
 
     await run_transfer_pipeline(
         update,
@@ -3367,6 +3371,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_size=file_size or 0,
         emoji=emoji,
         download_runner=telegram_download_runner,
+        max_download_retries=5,
     )
 
 
