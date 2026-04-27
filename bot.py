@@ -2977,6 +2977,54 @@ async def run_transfer_pipeline(
         # Reset speed/ETA stats for each new attempt
         progress_state["download_start_time"] = None
 
+        # Animated processing indicator while waiting for file to be ready
+        processing_active = {"running": True}
+
+        async def processing_animation():
+            """Show animated bar while get_file() waits for local API."""
+            frames = [
+                "░░█░░░░░░░░░",
+                "░░░█░░░░░░░░",
+                "░░░░█░░░░░░░",
+                "░░░░░█░░░░░░",
+                "░░░░░░█░░░░░",
+                "░░░░░░░█░░░░",
+                "░░░░░░░░█░░░",
+                "░░░░░░░░░█░░",
+                "░░░░░░░░░░█░",
+                "░░░░░░░░░█░░",
+                "░░░░░░░░█░░░",
+                "░░░░░░░█░░░░",
+                "░░░░░░█░░░░░",
+                "░░░░░█░░░░░░",
+                "░░░░█░░░░░░░",
+                "░░░█░░░░░░░░",
+            ]
+            frame_idx = 0
+            task = context.bot_data.get("transfer_tasks", {}).get(task_id, {})
+            attempt_num = task.get("attempt", 1)
+            max_att = task.get("max_attempts", 1)
+            attempt_label = f" (attempt {attempt_num}/{max_att})" if max_att > 1 else ""
+
+            while processing_active["running"]:
+                # Stop if real download progress has started
+                if progress_state["download_start_time"] is not None:
+                    break
+                try:
+                    await progress_msg.edit_text(
+                        f"{emoji} {filename}\n"
+                        f"📦 {size_label}\n\n"
+                        f"⏳ Processing file...{attempt_label}\n"
+                        f"{frames[frame_idx % len(frames)]}",
+                        reply_markup=transfer_keyboard()
+                    )
+                except Exception:
+                    pass
+                frame_idx += 1
+                await asyncio.sleep(1.5)
+
+        anim_task = asyncio.create_task(processing_animation())
+
         try:
             downloaded = await download_runner(
                 local_path,
@@ -2989,10 +3037,23 @@ async def run_transfer_pipeline(
             cleanup_local_file()
             await progress_msg.edit_text("❌ Cancelled")
             context.bot_data.get("transfer_tasks", {}).pop(task_id, None)
+            processing_active["running"] = False
+            anim_task.cancel()
+            try:
+                await anim_task
+            except asyncio.CancelledError:
+                pass
             return
         except Exception as e:
             logger.warning(f"Download attempt {attempt}/{max_download_retries} failed for {filename}: {e}")
             downloaded = False
+        finally:
+            processing_active["running"] = False
+            anim_task.cancel()
+            try:
+                await anim_task
+            except asyncio.CancelledError:
+                pass
 
         if downloaded:
             break
