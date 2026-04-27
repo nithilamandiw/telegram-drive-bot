@@ -79,6 +79,7 @@ COMMANDS = {
     "removeuser": ("\u2796 /removeuser <id>", "Remove user"),
     "addadmin": ("\U0001f451 /addadmin <id>", "Add admin"),
     "removeadmin": ("\u274c /removeadmin <id>", "Remove admin"),
+    "broadcast": ("\U0001f4e2 /broadcast <msg>", "Send message to all users"),
 }
 
 COMMAND_PERMISSIONS = {
@@ -99,6 +100,7 @@ COMMAND_PERMISSIONS = {
     "removeuser": "removeuser",
     "addadmin": "addadmin",
     "removeadmin": "removeadmin",
+    "broadcast": "broadcast",
 }
 
 logging.basicConfig(
@@ -316,6 +318,7 @@ def has_permission(user_id: int, context: ContextTypes.DEFAULT_TYPE, action: str
         "removeuser": ["owner", "admin"],
         "addadmin": ["owner"],
         "removeadmin": ["owner"],
+        "broadcast": ["owner", "admin"],
     }
     return role in permissions.get(action, [])
 
@@ -2009,6 +2012,63 @@ async def remove_admin_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         await message.reply_text("⚠️ Admin not in list")
 
 
+async def broadcast_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send a message to all registered users."""
+    message = update.message
+    user = update.effective_user
+
+    user_id = user.id if user else 0
+    if not has_permission(user_id, context, "broadcast"):
+        await message.reply_text("❌ Unauthorized access")
+        return
+
+    if not context.args:
+        await message.reply_text("Usage: /broadcast <message>")
+        return
+
+    broadcast_text = " ".join(context.args)
+
+    # Collect all unique user IDs (owner + admins + users)
+    all_ids = set()
+    if OWNER_ID:
+        all_ids.add(OWNER_ID)
+    admins_store = context.bot_data.get("admins", set())
+    if isinstance(admins_store, set):
+        all_ids.update(admins_store)
+    users_store = context.bot_data.get("users", set())
+    if isinstance(users_store, set):
+        all_ids.update(users_store)
+
+    if not all_ids:
+        await message.reply_text("⚠️ No users to send to.")
+        return
+
+    status_msg = await message.reply_text(
+        f"📢 Broadcasting to {len(all_ids)} users..."
+    )
+
+    sent = 0
+    failed = 0
+    for uid in all_ids:
+        try:
+            await context.bot.send_message(
+                chat_id=uid,
+                text=f"📢 *Broadcast*\n\n{broadcast_text}",
+                parse_mode="Markdown",
+            )
+            sent += 1
+        except Exception as e:
+            logger.warning(f"Broadcast failed for user {uid}: {e}")
+            failed += 1
+
+    await status_msg.edit_text(
+        f"✅ Broadcast complete\n\n"
+        f"📨 Sent: {sent}\n"
+        f"❌ Failed: {failed}\n"
+        f"👥 Total: {len(all_ids)}"
+    )
+
+
 async def files(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     user = update.effective_user
@@ -3491,6 +3551,7 @@ def main():
     app.add_handler(CommandHandler("removeuser", remove_user_handler))
     app.add_handler(CommandHandler("addadmin", add_admin_handler))
     app.add_handler(CommandHandler("removeadmin", remove_admin_handler))
+    app.add_handler(CommandHandler("broadcast", broadcast_handler))
     app.add_handler(CommandHandler("get", get_file_handler))
     app.add_handler(CommandHandler("files", files))
     app.add_handler(CommandHandler("search", search))
