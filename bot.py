@@ -47,7 +47,6 @@ SCOPES = ["https://www.googleapis.com/auth/drive"]
 URL_PATTERN = re.compile(r"(https?://\S+)", re.IGNORECASE)
 DRIVE_FILE_ID_PATTERN = re.compile(r"(?:/d/|id=)([a-zA-Z0-9_-]+)")
 MAX_URL_DOWNLOAD_SIZE = int(os.getenv("MAX_URL_DOWNLOAD_SIZE", "0"))  # 0 = unlimited
-DOWNLOADS_DIR = "./downloads"
 
 
 def _build_oauth_client_config():
@@ -321,11 +320,6 @@ def has_permission(user_id: int, context: ContextTypes.DEFAULT_TYPE, action: str
         "broadcast": ["owner", "admin"],
     }
     return role in permissions.get(action, [])
-
-
-def is_allowed(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    # Backward-compatible helper: any recognized role can pass.
-    return has_permission(user_id, context, "upload")
 
 
 def default_analytics_data() -> dict:
@@ -656,8 +650,6 @@ async def send_uploaded_ui(
 ):
     service = get_user_service(user_id)
 
-    # Keep link generation centralized for all uploaded/cloned success UI.
-    _ = clean_drive_file_url(file_id)
     upload_keyboard = await build_upload_action_keyboard(context, service, file_id)
 
     if message_to_edit is not None:
@@ -769,7 +761,7 @@ async def connect_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user:
         return
 
-    if not is_allowed(user.id, context):
+    if not has_permission(user.id, context, "upload"):
         await update.message.reply_text("\u274c Unauthorized access")
         return
 
@@ -798,7 +790,7 @@ async def disconnect_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not user:
         return
 
-    if not is_allowed(user.id, context):
+    if not has_permission(user.id, context, "upload"):
         await update.message.reply_text("\u274c Unauthorized access")
         return
 
@@ -896,6 +888,107 @@ async def newfolder_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"\u274c Failed to create folder: {e}")
 
 
+def _build_recent_text(user_id: int) -> str:
+    """Shared: build recent files text for both command and menu."""
+    service = get_user_service(user_id)
+    results = service.files().list(
+        pageSize=10,
+        orderBy="createdTime desc",
+        q="trashed = false",
+        fields="files(id, name, size, mimeType, createdTime, webViewLink)",
+    ).execute()
+    files_list = results.get("files", [])
+    if not files_list:
+        return "\U0001f4ed No files found in your Drive."
+    lines = ["\U0001f55b *Recent Files:*\n"]
+    for f in files_list:
+        name = f.get("name", "Unknown")
+        size = int(f.get("size", 0))
+        size_str = f"{size / (1024 * 1024):.2f} MB" if size > 0 else "---"
+        link = f.get("webViewLink", "")
+        lines.append(f"\U0001f4c4 [{name}]({link})")
+        lines.append(f"   {size_str}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+async def _build_storage_text(user_id: int) -> str:
+    """Shared: build storage info text with progress bar for both command and menu."""
+    service = get_user_service(user_id)
+    about = await asyncio.to_thread(
+        service.about().get(fields="storageQuota").execute
+    )
+    quota = about.get("storageQuota", {})
+    total = int(quota.get("limit", 0))
+    used = int(quota.get("usage", 0))
+    free = max(total - used, 0) if total else 0
+    to_gb = lambda b: b / (1024 ** 3)
+    if total > 0:
+        pct = (used / total) * 100
+        bar_len = 20
+        filled = int(bar_len * used / total)
+        bar = "\u2588" * filled + "\u2591" * (bar_len - filled)
+        return (
+            "\U0001f4be *Google Drive Storage*\n\n"
+            f"Used: `{to_gb(used):.2f} GB` / `{to_gb(total):.2f} GB`\n"
+            f"Free: `{to_gb(free):.2f} GB`\n\n"
+            f"`[{bar}]` {pct:.1f}%"
+        )
+    return (
+        "\U0001f4be *Google Drive Storage*\n\n"
+        "Total: `Unlimited`\n"
+        f"Used: `{to_gb(used):.2f} GB`\n"
+        "Free: `Unlimited`"
+    )
+
+
+def _build_analytics_text() -> str:
+    """Shared: build analytics text for both command and menu."""
+    data = load_analytics()
+    today_key = datetime.now().strftime("%Y-%m-%d")
+    today_data = data.get("daily", {}).get(today_key, {"uploads": 0, "size": 0})
+    types = data.get("types", {})
+    top_types = sorted(types.items(), key=lambda x: x[1], reverse=True)[:5]
+    types_text = "\n".join([f"{ext}: {count}" for ext, count in top_types]) if top_types else "No uploads yet"
+    return (
+        "\U0001f4c8 *Analytics*\n\n"
+        f"Uploads: *{int(data.get('total_uploads', 0))}*\n"
+        f"Downloads: *{int(data.get('total_downloads', 0))}*\n"
+        f"Total data: *{int(data.get('total_size', 0)) / (1024**3):.2f} GB*\n\n"
+        "\U0001f4c5 *Today:*\n"
+        f"Uploads: {int(today_data.get('uploads', 0))}\n"
+        f"Size: {format_bytes_stats(int(today_data.get('size', 0)))}\n\n"
+        "\U0001f4c1 *Top file types:*\n"
+        f"{types_text}"
+    )
+
+
+def _build_trash_content(user_id: int) -> tuple[str, list]:
+    """Shared: build trash text and action buttons for both command and menu."""
+    service = get_user_service(user_id)
+    results = service.files().list(
+        pageSize=15,
+        q="trashed = true",
+        fields="files(id, name, size, mimeType)",
+    ).execute()
+    files_list = results.get("files", [])
+    if not files_list:
+        return "\U0001f5d1 Trash is empty!", []
+    lines = ["\U0001f5d1 *Trash:*\n"]
+    buttons = []
+    for f in files_list:
+        name = f.get("name", "Unknown")
+        size = int(f.get("size", 0))
+        size_str = f"{size / (1024 * 1024):.2f} MB" if size > 0 else "folder"
+        lines.append(f"\U0001f4c4 {name} ({size_str})")
+        buttons.append([
+            InlineKeyboardButton(f"\u267b\ufe0f {name[:18]}", callback_data=f"cb_restore_{f['id']}"),
+            InlineKeyboardButton(f"\U0001f5d1 {name[:18]}", callback_data=f"cb_permdelete_{f['id']}"),
+        ])
+    buttons.append([InlineKeyboardButton("\U0001f5d1 Empty Trash", callback_data="cb_emptytrash")])
+    return "\n".join(lines), buttons
+
+
 async def recent_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show recently uploaded files from the user's Google Drive."""
     user = update.effective_user
@@ -906,39 +999,9 @@ async def recent_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_connection(update, user.id):
         return
 
-    service = get_user_service(user.id)
-    if not service:
-        await update.message.reply_text("\u274c Could not connect to Google Drive. Try /connect again.")
-        return
-
     try:
-        results = service.files().list(
-            pageSize=10,
-            orderBy="createdTime desc",
-            q="trashed = false",
-            fields="files(id, name, size, mimeType, createdTime, webViewLink)",
-        ).execute()
-        files = results.get("files", [])
-
-        if not files:
-            await update.message.reply_text("\U0001f4ed No files found in your Drive.")
-            return
-
-        lines = ["\U0001f55b **Recent Files:**\n"]
-        for f in files:
-            name = f.get("name", "Unknown")
-            size = int(f.get("size", 0))
-            size_str = f"{size / (1024 * 1024):.2f} MB" if size > 0 else "---"
-            link = f.get("webViewLink", "")
-            lines.append(f"\U0001f4c4 [{name}]({link})")
-            lines.append(f"   {size_str}")
-            lines.append("")
-
-        await update.message.reply_text(
-            "\n".join(lines),
-            parse_mode="Markdown",
-            disable_web_page_preview=True,
-        )
+        text = _build_recent_text(user.id)
+        await update.message.reply_text(text, parse_mode="Markdown", disable_web_page_preview=True)
     except Exception as e:
         logger.error(f"Failed to get recent files for user {user.id}: {e}")
         await update.message.reply_text(f"\u274c Failed to get recent files: {e}")
@@ -954,42 +1017,12 @@ async def trash_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_connection(update, user.id):
         return
 
-    service = get_user_service(user.id)
-    if not service:
-        await update.message.reply_text("\u274c Could not connect to Google Drive. Try /connect again.")
-        return
-
     try:
-        results = service.files().list(
-            pageSize=15,
-            q="trashed = true",
-            fields="files(id, name, size, mimeType)",
-        ).execute()
-        files = results.get("files", [])
-
-        if not files:
-            await update.message.reply_text("\U0001f5d1 Trash is empty!")
-            return
-
-        lines = ["\U0001f5d1 **Trash:**\n"]
-        buttons = []
-        for f in files:
-            name = f.get("name", "Unknown")
-            size = int(f.get("size", 0))
-            size_str = f"{size / (1024 * 1024):.2f} MB" if size > 0 else "folder"
-            lines.append(f"\U0001f4c4 {name} ({size_str})")
-            buttons.append([
-                InlineKeyboardButton(f"\u267b\ufe0f Restore {name[:20]}", callback_data=f"cb_restore_{f['id']}"),
-                InlineKeyboardButton(f"\U0001f5d1 Delete {name[:20]}", callback_data=f"cb_permdelete_{f['id']}"),
-            ])
-
-        buttons.append([InlineKeyboardButton("\U0001f5d1 Empty Trash", callback_data="cb_emptytrash")])
-
-        await update.message.reply_text(
-            "\n".join(lines),
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(buttons),
-        )
+        text, buttons = _build_trash_content(user.id)
+        if buttons:
+            await update.message.reply_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
+        else:
+            await update.message.reply_text(text)
     except Exception as e:
         logger.error(f"Failed to get trash for user {user.id}: {e}")
         await update.message.reply_text(f"\u274c Failed to get trash: {e}")
@@ -1381,29 +1414,8 @@ async def main_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if action == "recent":
         if not await require_connection(update, user.id):
             return
-        service = get_user_service(user.id)
-        if not service:
-            await query.edit_message_text("\u274c Drive connection error. Try /connect.")
-            return
         try:
-            results = service.files().list(
-                pageSize=10, orderBy="createdTime desc", q="trashed = false",
-                fields="files(id, name, size, mimeType, createdTime, webViewLink)",
-            ).execute()
-            files_list = results.get("files", [])
-            if not files_list:
-                text = "\U0001f4ed No files found."
-            else:
-                lines = ["\U0001f55b *Recent Files:*\n"]
-                for f in files_list:
-                    name = f.get("name", "Unknown")
-                    size = int(f.get("size", 0))
-                    size_str = f"{size / (1024 * 1024):.2f} MB" if size > 0 else "---"
-                    link = f.get("webViewLink", "")
-                    lines.append(f"\U0001f4c4 [{name}]({link})")
-                    lines.append(f"   {size_str}")
-                    lines.append("")
-                text = "\n".join(lines)
+            text = _build_recent_text(user.id)
             keyboard = InlineKeyboardMarkup([[
                 InlineKeyboardButton("\u25c0\ufe0f Back to Menu", callback_data="menu_back")
             ]])
@@ -1436,30 +1448,8 @@ async def main_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if action == "storage":
         if not await require_connection(update, user.id):
             return
-        service = get_user_service(user.id)
-        if not service:
-            await query.edit_message_text("\u274c Drive connection error.")
-            return
         try:
-            about = await asyncio.to_thread(service.about().get(fields="storageQuota").execute)
-            quota = about.get("storageQuota", {})
-            total = int(quota.get("limit", 0))
-            used = int(quota.get("usage", 0))
-            free = max(total - used, 0) if total else 0
-            to_gb = lambda b: b / (1024 ** 3)
-            if total > 0:
-                pct = (used / total) * 100
-                bar_len = 20
-                filled = int(bar_len * used / total)
-                bar = "\u2588" * filled + "\u2591" * (bar_len - filled)
-                text = (
-                    "\U0001f4be *Google Drive Storage*\n\n"
-                    f"Used: `{to_gb(used):.2f} GB` / `{to_gb(total):.2f} GB`\n"
-                    f"Free: `{to_gb(free):.2f} GB`\n\n"
-                    f"`[{bar}]` {pct:.1f}%"
-                )
-            else:
-                text = f"\U0001f4be *Storage*\n\nUsed: `{to_gb(used):.2f} GB`"
+            text = await _build_storage_text(user.id)
             keyboard = InlineKeyboardMarkup([[
                 InlineKeyboardButton("\u25c0\ufe0f Back to Menu", callback_data="menu_back")
             ]])
@@ -1504,13 +1494,7 @@ async def main_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     if action == "analytics":
-        analytics = load_analytics()
-        text = (
-            "\U0001f4c8 *Analytics*\n\n"
-            f"Total uploads: *{analytics.get('total_uploads', 0)}*\n"
-            f"Total downloads: *{analytics.get('total_downloads', 0)}*\n"
-            f"Total data: *{analytics.get('total_size', 0) / (1024**3):.2f} GB*"
-        )
+        text = _build_analytics_text()
         keyboard = InlineKeyboardMarkup([[
             InlineKeyboardButton("\u25c0\ufe0f Back to Menu", callback_data="menu_back")
         ]])
@@ -1520,37 +1504,12 @@ async def main_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if action == "trash":
         if not await require_connection(update, user.id):
             return
-        service = get_user_service(user.id)
-        if not service:
-            await query.edit_message_text("\u274c Drive connection error.")
-            return
         try:
-            results = service.files().list(
-                pageSize=15, q="trashed = true",
-                fields="files(id, name, size, mimeType)",
-            ).execute()
-            files_list = results.get("files", [])
-            if not files_list:
-                text = "\U0001f5d1 Trash is empty!"
-                keyboard = InlineKeyboardMarkup([[
-                    InlineKeyboardButton("\u25c0\ufe0f Back to Menu", callback_data="menu_back")
-                ]])
-            else:
-                lines = ["\U0001f5d1 *Trash:*\n"]
-                btns = []
-                for f in files_list:
-                    name = f.get("name", "Unknown")
-                    size = int(f.get("size", 0))
-                    size_str = f"{size / (1024 * 1024):.2f} MB" if size > 0 else "folder"
-                    lines.append(f"\U0001f4c4 {name} ({size_str})")
-                    btns.append([
-                        InlineKeyboardButton(f"\u267b\ufe0f {name[:18]}", callback_data=f"cb_restore_{f['id']}"),
-                        InlineKeyboardButton(f"\U0001f5d1 {name[:18]}", callback_data=f"cb_permdelete_{f['id']}"),
-                    ])
-                btns.append([InlineKeyboardButton("\U0001f5d1 Empty Trash", callback_data="cb_emptytrash")])
-                btns.append([InlineKeyboardButton("\u25c0\ufe0f Back to Menu", callback_data="menu_back")])
-                text = "\n".join(lines)
-                keyboard = InlineKeyboardMarkup(btns)
+            text, buttons = _build_trash_content(user.id)
+            buttons.append([InlineKeyboardButton("\u25c0\ufe0f Back to Menu", callback_data="menu_back")])
+            keyboard = InlineKeyboardMarkup(buttons) if buttons else InlineKeyboardMarkup([[
+                InlineKeyboardButton("\u25c0\ufe0f Back to Menu", callback_data="menu_back")
+            ]])
             await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
         except Exception as e:
             await query.edit_message_text(f"\u274c Error: {e}")
@@ -1616,33 +1575,7 @@ async def storage(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        service = get_user_service(user.id)
-        about = await asyncio.to_thread(
-            service.about().get(fields="storageQuota").execute
-        )
-        quota = about.get("storageQuota", {})
-
-        total = int(quota.get("limit", 0))
-        used = int(quota.get("usage", 0))
-        free = max(total - used, 0) if total else 0
-
-        to_gb = lambda b: b / (1024 ** 3)
-
-        if total > 0:
-            text = (
-                "💾 *Google Drive Storage*\n\n"
-                f"Total: `{to_gb(total):.2f} GB`\n"
-                f"Used: `{to_gb(used):.2f} GB`\n"
-                f"Free: `{to_gb(free):.2f} GB`"
-            )
-        else:
-            text = (
-                "💾 *Google Drive Storage*\n\n"
-                "Total: `Unlimited`\n"
-                f"Used: `{to_gb(used):.2f} GB`\n"
-                "Free: `Unlimited`"
-            )
-
+        text = await _build_storage_text(user.id)
         await message.reply_text(text, parse_mode="Markdown")
     except Exception as e:
         logger.error(f"Storage command failed: {e}")
@@ -1876,27 +1809,8 @@ async def analytics_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("❌ Unauthorized access")
         return
 
-    data = load_analytics()
-    today_key = datetime.now().strftime("%Y-%m-%d")
-    today_data = data.get("daily", {}).get(today_key, {"uploads": 0, "size": 0})
-
-    types = data.get("types", {})
-    top_types = sorted(types.items(), key=lambda x: x[1], reverse=True)[:5]
-    types_text = "\n".join([f"{ext}: {count}" for ext, count in top_types]) if top_types else "No uploads yet"
-
-    text = (
-        "📊 Usage Stats\n\n"
-        f"Uploads: {int(data.get('total_uploads', 0))}\n"
-        f"Downloads: {int(data.get('total_downloads', 0))}\n"
-        f"Total uploaded: {format_bytes_stats(int(data.get('total_size', 0)))}\n\n"
-        "📅 Today:\n"
-        f"Uploads: {int(today_data.get('uploads', 0))}\n"
-        f"Size: {format_bytes_stats(int(today_data.get('size', 0)))}\n\n"
-        "📁 Top file types:\n"
-        f"{types_text}"
-    )
-
-    await message.reply_text(text)
+    text = _build_analytics_text()
+    await message.reply_text(text, parse_mode="Markdown")
 
 
 async def adduser_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
