@@ -192,8 +192,14 @@ Apply:
 
 ```bash
 sudo caddy validate --config /etc/caddy/Caddyfile
-sudo systemctl restart caddy
-sudo systemctl status caddy --no-pager
+sudo caddy reload --config /etc/caddy/Caddyfile
+```
+
+If Caddy is not already running, start it manually in tmux:
+
+```bash
+tmux new -s caddy
+sudo caddy run --config /etc/caddy/Caddyfile
 ```
 
 Why `127.0.0.1`?
@@ -263,6 +269,24 @@ tmux ls
 tmux attach -t telegrambot
 tmux kill-session -t telegrambot
 ```
+
+Update bot from GitHub:
+
+```bash
+cd ~/telegram-drive-bot
+git pull origin main
+tmux new -s telegrambot
+source .venv/bin/activate
+python bot.py
+```
+
+If the tmux session already exists:
+
+```bash
+tmux attach -t telegrambot
+```
+
+Then stop the running bot with `Ctrl+c`, pull the latest code, start it again, and detach with `Ctrl+b`, then `d`.
 
 ### 11. Verify end-to-end
 
