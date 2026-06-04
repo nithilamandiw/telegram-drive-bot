@@ -425,7 +425,7 @@ async def clone_drive_file(user_id: int, source_file_id: str):
     service = get_user_service(user_id)
 
     original = await asyncio.to_thread(
-        service.files().get(fileId=source_file_id, fields="id,name").execute
+        service.files().get(fileId=source_file_id, fields="id,name,size").execute
     )
     original_name = original.get("name", "Unnamed file")
 
@@ -433,7 +433,7 @@ async def clone_drive_file(user_id: int, source_file_id: str):
         service.files().copy(
             fileId=source_file_id,
             body={"name": original_name},
-            fields="id,name"
+            fields="id,name,size"
         ).execute
     )
 
@@ -444,6 +444,7 @@ async def clone_drive_file(user_id: int, source_file_id: str):
     return {
         "id": new_id,
         "name": copied.get("name", original_name),
+        "size": copied.get("size", original.get("size")),
     }
 
 
@@ -646,19 +647,25 @@ async def send_uploaded_ui(
     user_id: int,
     file_id: str,
     filename: str,
+    file_size=None,
     message_to_edit=None,
 ):
     service = get_user_service(user_id)
 
     upload_keyboard = await build_upload_action_keyboard(context, service, file_id)
+    upload_text = (
+        "✅ Upload Finished\n"
+        f"📄 {filename}\n"
+        f"📦 {format_bytes_stats(file_size)}"
+    )
 
     if message_to_edit is not None:
-        await message_to_edit.edit_text("✅ Uploaded!", reply_markup=upload_keyboard)
+        await message_to_edit.edit_text(upload_text, reply_markup=upload_keyboard)
         return
 
     target_message = update.message if update.message else (update.callback_query.message if update.callback_query else None)
     if target_message:
-        await target_message.reply_text("✅ Uploaded!", reply_markup=upload_keyboard)
+        await target_message.reply_text(upload_text, reply_markup=upload_keyboard)
 
 
 async def check_duplicate(service, filename: str, file_size: int | None):
@@ -3210,6 +3217,7 @@ async def run_transfer_pipeline(
             user_id,
             uploaded_file_id,
             filename,
+            file_size=known_size,
             message_to_edit=progress_msg,
         )
         await notify(
@@ -3317,6 +3325,7 @@ async def handle_drive_link_message(update: Update, context: ContextTypes.DEFAUL
             user.id,
             cloned["id"],
             cloned.get("name", "cloned_file"),
+            file_size=cloned.get("size"),
             message_to_edit=status_msg,
         )
     except HttpError as e:
